@@ -1,0 +1,44 @@
+# VLM Routing Agent configuration
+
+agent:
+  max_iterations: 20
+  patience: 5
+  checkpoint_interval: 1
+
+vlm:
+  # Primary model. For Kimi via the Anthropic-compatible endpoint, set
+  # ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL, and ANTHROPIC_MODEL in .env and
+  # use the model name below (or the one provided by Kimi).
+  model: "kimi-for-coding"
+  fallback_model: "kimi-for-coding"
+  client_type: "anthropic"
+  temperature: 0.1
+  max_retries: 3
+  retry_delay: 2.0
+  timeout: 120
+
+openroad:
+  exe: "openroad"
+  threads: 8
+  timeout:
+    baseline: 3600
+    incremental: 1800
+    drc_check: 1200
+    congestion: 300
+
+visualization:
+  resolution: 512
+  dpi: 150
+  layers:
+    - "M2"
+    - "M3"
+    - "M4"
+    - "M5"
+
+evaluation:
+  scoring_mode: "simplified"
+  save_reports: true
+
+logging:
+  level: "INFO"
+  log_dir: "./logs"
