@@ -1,8 +1,8 @@
 """
 src/agent_controller.py
 
-Agent controller. Orchestrates the optimization loop:
-Extract -> Render -> VLM Policy -> Execute -> Evaluate -> Iterate.
+Agent controller. Orchestrates the redesigned optimization loop:
+Extract -> Render -> VLM Diagnose/Strategize -> Execute -> Evaluate -> Attribute -> Iterate.
 """
 
 import json
@@ -13,6 +13,9 @@ from pathlib import Path
 from dataclasses import asdict
 
 from .routing_toolkit import RoutingToolkit, RoutingMetrics, RoutingState
+from .openroad_provider import OpenROADProvider
+from .policy_executor import PolicyExecutor
+from .attribution_engine import AttributionEngine
 from .visual_renderer import VisualRenderer
 from .vlm_policy import VLMPolicyGenerator
 
@@ -22,7 +25,8 @@ class RoutingAgent:
     Routing optimization agent.
 
     Runs a ReAct-style loop where the VLM reasons about routing state and the
-    agent executes tool calls. Maintains best solution, history, and checkpoints.
+    agent executes tool calls.  Maintains best solution, history, checkpoints,
+    and attributable feedback.
     """
 
     def __init__(
@@ -33,6 +37,8 @@ class RoutingAgent:
         work_dir: str,
         max_iterations: int = 20,
         patience: int = 5,
+        enable_fine_actions: bool = True,
+        local_edit_threshold: int = 3,
     ):
         self.toolkit = toolkit
         self.renderer = renderer
@@ -41,13 +47,26 @@ class RoutingAgent:
         self.work_dir.mkdir(parents=True, exist_ok=True)
         self.max_iterations = max_iterations
         self.patience = patience
+        self.enable_fine_actions = enable_fine_actions
 
-        self.history: List[Tuple[str, RoutingMetrics, str]] = []
+        self.history: List[Tuple[str, RoutingMetrics, str, Optional[Dict]]] = []
         self.current_def: Optional[str] = None
         self.current_metrics: Optional[RoutingMetrics] = None
+        self.current_violations: List = []
+        self.current_net_features: Dict = {}
         self.best_def: Optional[str] = None
         self.best_metrics: Optional[RoutingMetrics] = None
         self.no_improve_count = 0
+
+        # New architecture components
+        self.provider = OpenROADProvider(toolkit)
+        self.executor = PolicyExecutor(
+            self.provider,
+            enable_fine_actions=enable_fine_actions,
+            local_edit_threshold_nets=local_edit_threshold,
+        )
+        self.attribution_engine = AttributionEngine()
+        self.last_attribution: Optional[Dict] = None
 
     def optimize(
         self, initial_def: str, guide_file: Optional[str] = None
@@ -61,8 +80,8 @@ class RoutingAgent:
         print("\n[Phase 1] Running baseline routing...")
         start_time = time.time()
 
-        self.current_def = self.toolkit.run_baseline_flow(initial_def, guide_file)
-        self.current_metrics = self.toolkit.extract_metrics(self.current_def)
+        self.current_def = self.provider.run_baseline_flow(initial_def, guide_file)
+        self.current_metrics = self.provider.extract_metrics(self.current_def)
 
         baseline_time = time.time() - start_time
         print(f"[OK] Baseline complete in {baseline_time:.1f}s")
@@ -93,7 +112,7 @@ class RoutingAgent:
 
             iter_start = time.time()
 
-            print("  [Step 1/5] Extracting state...")
+            print("  [Step 1/5] Extracting rich state...")
             state = self._extract_state(self.current_def)
 
             print("  [Step 2/5] Rendering visual state...")
@@ -110,6 +129,12 @@ class RoutingAgent:
                 last_action=last_action,
                 last_metrics=asdict(last_metrics) if last_metrics else None,
                 iteration=iteration,
+                drc_violations=state.drc_violations,
+                net_features=state.net_features,
+                previous_attribution=self.last_attribution,
+                violation_crop_paths=image_paths[1:]
+                if len(image_paths) > 1
+                else [],
             )
 
             policy_data = policy.get("routing_policy", {})
@@ -123,17 +148,44 @@ class RoutingAgent:
                 break
 
             print("  [Step 4/5] Executing policy...")
-            new_def, new_metrics = self._execute_policy(
-                self.current_def, policy, iteration
+            new_def, execution_report = self.executor.execute_policy(
+                self.current_def,
+                policy,
+                self.current_violations,
+                self.current_net_features,
             )
 
-            print("  [Step 5/5] Evaluating result...")
+            print("  [Step 5/5] Evaluating and attributing result...")
+            new_violations = self.provider.extract_drc_report(new_def)
+            new_net_features = self.toolkit.extract_net_routing_features(
+                new_def,
+                drc_violations=new_violations,
+                congestion_map=state.congestion_map,
+            )
+            new_metrics = self.provider.extract_metrics(
+                new_def, drc_violations=new_violations
+            )
+
+            attribution = self.attribution_engine.compute_delta(
+                self.current_metrics,
+                new_metrics,
+                self.current_violations,
+                new_violations,
+                execution_report,
+            )
+            self.last_attribution = attribution.to_dict()
+
             drc_change = new_metrics.drc_total - self.current_metrics.drc_total
             wl_change = new_metrics.wirelength - self.current_metrics.wirelength
 
             print(
                 f"    Result: DRC={new_metrics.drc_total} ({drc_change:+d}), "
                 f"WL={new_metrics.wirelength:.2f} ({wl_change:+.2f})"
+            )
+            print(
+                f"    Attribution: fixed={len(attribution.fixed_violations)}, "
+                f"new={len(attribution.new_violations)}, "
+                f"moved={len(attribution.moved_violations)}"
             )
 
             is_better = self._is_better_metrics(new_metrics, self.best_metrics)
@@ -146,10 +198,14 @@ class RoutingAgent:
                 self.no_improve_count += 1
 
             action_str = strategy_type
-            self.history.append((image_paths[0], new_metrics, action_str))
+            self.history.append(
+                (image_paths[0], new_metrics, action_str, self.last_attribution)
+            )
 
             self.current_def = new_def
             self.current_metrics = new_metrics
+            self.current_violations = new_violations
+            self.current_net_features = new_net_features
 
             self._save_checkpoint(iteration, new_def, new_metrics)
 
@@ -181,20 +237,31 @@ class RoutingAgent:
         return self.best_def, self.best_metrics
 
     def _extract_state(self, def_file: str) -> RoutingState:
-        congestion = self.toolkit.extract_congestion_map(def_file)
-        routing_layers = self.toolkit.extract_routing_layers(
+        congestion = self.provider.extract_congestion_map(def_file)
+        routing_layers = self.provider.extract_routing_layers(
             def_file, layers=["M2", "M3", "M4", "M5"]
         )
         netlist_stats = self.toolkit.extract_netlist_stats(def_file)
-        drc_report = self.toolkit.extract_drc_report(def_file)
+        drc_violations = self.provider.extract_drc_report(def_file)
+        net_features = self.toolkit.extract_net_routing_features(
+            def_file,
+            drc_violations=drc_violations,
+            congestion_map=congestion,
+        )
+
+        # Build a legacy-style drc_report dict from structured violations
+        drc_report = {
+            "total_violations": len(drc_violations),
+            "violations": [v.to_dict() for v in drc_violations],
+        }
+        for v in drc_violations:
+            key = v.vtype.lower()
+            drc_report.setdefault(key, 0)
+            drc_report[key] += 1
 
         drc_markers = []
-        for v in drc_report.get("violations", []):
-            if isinstance(v, dict) and "x" in v and "y" in v:
-                vtype = v.get("type", "unknown")
-                x = v["x"]
-                y = v["y"]
-                drc_markers.append((x, y, vtype))
+        for v in drc_violations:
+            drc_markers.append((v.center[0], v.center[1], v.vtype))
 
         return RoutingState(
             def_file=def_file,
@@ -204,6 +271,8 @@ class RoutingAgent:
             netlist_stats=netlist_stats,
             drc_report=drc_report,
             drc_markers=drc_markers,
+            drc_violations=drc_violations,
+            net_features=net_features,
             iteration=len(self.history),
         )
 
@@ -223,6 +292,16 @@ class RoutingAgent:
 
         images = [main_image]
 
+        # Render violation crops
+        crop_paths = self.renderer.render_violation_crops(
+            drc_violations=state.drc_violations,
+            congestion_map=state.congestion_map,
+            routing_layers=state.routing_layers,
+            iteration=iteration,
+            max_crops=6,
+        )
+        images.extend(crop_paths)
+
         if self.history:
             prev_image = self.history[-1][0]
             if Path(prev_image).exists() and Path(main_image).exists():
@@ -232,68 +311,6 @@ class RoutingAgent:
                 images.append(diff_image)
 
         return images
-
-    def _execute_policy(
-        self, def_file: str, policy: Dict, iteration: int
-    ) -> Tuple[str, RoutingMetrics]:
-        policy_data = policy.get("routing_policy", {})
-        actions = policy_data.get("priority_actions", [])
-
-        current_def = def_file
-
-        if not actions:
-            print("    No actions specified, returning current state")
-            metrics = self.toolkit.extract_metrics(current_def)
-            return current_def, metrics
-
-        for action in actions:
-            action_type = action.get("action", "")
-
-            if action_type == "rip_up_reroute":
-                target_nets = action.get("target_nets", [])
-                if target_nets:
-                    print(f"    Action: Rip-up & reroute {len(target_nets)} nets")
-                    current_def, _ = self.toolkit.rip_up_and_reroute(
-                        current_def, target_nets, action
-                    )
-                else:
-                    print("    Action: rip_up_reroute with no target nets, skipping")
-                    metrics = self.toolkit.extract_metrics(current_def)
-                    return current_def, metrics
-
-            elif action_type == "incremental_route":
-                print("    Action: Incremental route")
-                current_def = self.toolkit.run_incremental_route(current_def)
-
-            elif action_type == "layer_assign":
-                target_nets = action.get("target_nets", [])
-                if target_nets:
-                    print(f"    Action: Layer assign for {len(target_nets)} nets")
-                    current_def, _ = self.toolkit.rip_up_and_reroute(
-                        current_def, target_nets, action
-                    )
-
-            elif action_type == "set_blockage":
-                avoid_regions = action.get("avoid_regions", [])
-                if avoid_regions:
-                    print(f"    Action: Set {len(avoid_regions)} routing blockages")
-                    for region in avoid_regions:
-                        bbox = region.get("bbox")
-                        if bbox and len(bbox) == 4:
-                            layers = action.get("layer_preference", ["M2", "M3", "M4"])
-                            current_def = self.toolkit.set_routing_blockage(
-                                current_def, tuple(bbox), layers
-                            )
-
-            elif action_type == "terminate":
-                print("    Action: Terminate")
-                break
-
-            else:
-                print(f"    Unknown action type: {action_type}, skipping")
-
-        final_metrics = self.toolkit.extract_metrics(current_def)
-        return current_def, final_metrics
 
     @staticmethod
     def _is_better_metrics(new: RoutingMetrics, best: RoutingMetrics) -> bool:

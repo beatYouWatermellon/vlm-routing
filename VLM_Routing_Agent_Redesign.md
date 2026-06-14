@@ -147,7 +147,7 @@ TritonRoute 是工业级详细路由器。对于 ISPD 2018/2019 标准 benchmark
 |----------|---------|-------------|
 | **Segment-level** | `rip_up_segment`, `reassign_layer`, `insert_jog` | 编辑单个 wire segment |
 | **Via-level** | `move_via`, `change_via_type` | 编辑单个 via |
-| **Net-level** | `rip_up_net`, `reroute_net_with_constraints` | 粗粒度 net 编辑（保留为 fallback） |
+| **Net-level** | `rip_up_net`, `reroute_net_with_constraints`, `fishbone_route_net` | 粗/中粒度 net 编辑；`fishbone_route_net` 为自研拓扑初始化算子 |
 | **Region-level** | `set_routing_blockage`, `set_soft_guidance`, `relax_region` | 修改局部布线资源 |
 | **Control** | `terminate`, `noop` | 循环控制 |
 
@@ -296,6 +296,87 @@ TritonRoute 是工业级详细路由器。对于 ISPD 2018/2019 标准 benchmark
 ```
 
 **执行方式**：`TclGenerator` 生成 Tcl：撕 net → 注入临时 blockage → `set_routing_layers` → `detailed_route` → 移除临时 blockage。
+
+---
+
+#### `fishbone_route_net`
+
+自研 net-level 布线算子。对目标 net 的所有 pin 用“一条/两条主干（trunk）+ 多条分支（branch）+ via 连接点”的鱼骨拓扑重新布线，作为 OpenROAD detailed route 的高质量初始结构，再由 OpenROAD 做 DRC 精修。
+
+```json
+{
+  "action": "fishbone_route_net",
+  "parameters": {
+    "net_name": "net_123",
+    "preferred_layers": ["Metal2", "Metal3", "Metal4"],
+    "trunk_direction": "auto",
+    "max_branches_per_trunk": 50,
+    "obstacle_margin_nm": 200
+  },
+  "reason": "High fanout net; fishbone topology may reduce via count and ease DRC convergence",
+  "expected_impact": "via_reduce"
+}
+```
+
+**设计原则**：
+
+- **层选择启发式**：从 `preferred_layers` 的最低层开始尝试，优先使用 LEF 中标记为 `preferred_direction` 的层；坐标全部按 `PITCH` / `OFFSET` 对齐。
+- **必须做 obstacle 避让**：解析其他 net 的 segment / via 构建 obstacle map，trunk 选址和 branch 走线均考虑避让。
+- **可用于所有 net**：VLM 可建议任意 net；也可由启发式自动选择高 fanout / 长 HPWL net。
+- **OpenROAD 仍是最终验证者**：生成鱼骨路径后写回 DEF，调用 detailed route / DRC；若 DRC 恶化，优先保留无冲突的鱼骨路径，仅对冲突区域做局部修复或 OpenROAD 局部重布；仅当局部修复失败时才整 net fallback。
+
+**执行方式**：
+
+```
+读取 DEF/LEF
+  │
+  ▼
+提取 net pin 坐标与 access 点
+  │
+  ▼
+启发式选择 trunk 方向、层、位置
+  ├── 层：从 preferred_layers 最低层开始，按 LEF preferred_direction 筛选
+  ├── 方向：默认与 pin 分布长边正交；bbox 接近方形时取层 preferred_direction
+  └── 位置：在 bbox 内按 track 扫描，选 obstacle density 最低的 track
+  │
+  ▼
+投影 pin 到 trunk，合并过近点
+  │
+  ▼
+生成分支（branch）
+  ├── 从 pin access 点到 trunk 连接点走 Manhattan 路径
+  ├── 遇到 obstacle 时插入局部 jog 避让
+  └── 避让搜索限制在 net bbox + margin 内
+  │
+  ▼
+在 branch-trunk 交汇处插入 via（使用 LEF 默认 via）
+  │
+  ▼
+DEFEditor 删除旧布线并写回新鱼骨路径
+  │
+  ▼
+OpenROAD detailed_route -output_drc 验证
+  │
+  ▼
+若 DRC 恶化，保留清洁鱼骨路径，对冲突区域局部修复；失败或无路径时再整 net fallback OpenROAD。
+```
+
+**Obstacle 避让**：
+
+- 收集非目标 net 的 segment / via，按层扩展 `obstacle_margin_nm`。
+- Trunk 选址 cost：`cost = w1 * obstacle_density + w2 * branch_total_length + w3 * via_count`。
+- Branch 避让：若 Manhattan 直线路径与 obstacle 冲突，在冲突点附近做局部 A* / 扫描搜索，生成 L 形或 Z 形 jog；搜索范围限制在目标 net bbox 外扩 margin。
+
+**风险与 Fallback**：
+
+| 风险 | Fallback |
+|---|---|
+| 某 pin 无合法 access 点 | 跳过该 pin 并记录；整 net fallback OpenROAD |
+| Branch 避让失败 | 该 branch 或整 net fallback OpenROAD |
+| 生成后 DRC 增加 | 保留无冲突的鱼骨路径，仅对冲突 segment/branch 做局部修复（jog/改层/OpenROAD 局部重布）；局部修复失败再整 net fallback |
+| 层选择导致 off-grid | 所有坐标按 LEF PITCH / OFFSET 对齐 |
+
+**执行方式**：`PolicyExecutor` 分发给 `LocalRouter.fishbone_route()` → `DEFEditor.replace_net_routing()` → `OpenROADProvider.detailed_route()`；若出现新 DRC，先由 `LocalRouter`/`DEFEditor` 做局部修复，失败时整 net fallback → `AttributionEngine` 记录 delta。
 
 ---
 
@@ -535,14 +616,16 @@ Via delta: +1
 
 | 层 | 类 | 职责 |
 |-------|-------|----------------|
-| Action Dispatcher | `PolicyExecutor` | 解析 JSON policy、校验动作、分发到低层 handler |
-| Low-Level Handlers | `DEFEditor`, `TclGenerator`, `ODBEditor` | 执行 DEF 文本编辑或 Tcl 脚本 |
+| Action Dispatcher | `PolicyExecutor` | 解析 JSON policy、校验动作、分发到低层 handler 或 EDAProvider |
+| Local Edit Engine | `DEFEditor`, `LocalRouter`, `ODBEditor`, `TclGenerator` | 执行 DEF 文本编辑、自研局部布线算子、odb 编辑或 Tcl 脚本生成 |
+| EDA Backend | `EDAProvider` / `OpenROADProvider` | 全局/详细布线、DRC/metrics 提取，支持未来切换商业 EDA |
 
 ### 6.2 PolicyExecutor
 
 新建 `src/policy_executor.py`：
 - `execute_policy(def_file, policy, current_violations, current_net_features)` 依次执行 policy 中的 action。
 - 每个 action 包在 try/except 中，失败时记录错误并继续。
+- segment/via/region 级编辑交给 `DEFEditor`/`LocalRouter`/`ODBEditor`；全局布线、DRC 验证和 metrics 提取统一通过 `EDAProvider` 完成。
 - 根据编辑 net 数量决定做 local 还是 global 评估。
 - 返回 `(new_def, new_metrics, execution_report)`。
 
@@ -569,6 +652,57 @@ Via delta: +1
 - 使用 OpenROAD `odb` Python API 直接操作 design database。
 - 更快速、更稳健，尤其适用于复杂编辑（插入带 via 的 jog）。
 - `PolicyExecutor` 优先尝试 `ODBEditor`，不可用时回退到 `DEFEditor`。
+
+---
+
+### 6.6 EDA 后端抽象层（EDAProvider）
+
+为支持未来从 OpenROAD 切换到商业 EDA 工具，引入 `EDAProvider` 抽象接口。OpenROAD 只是该接口的第一个实现；PolicyExecutor 与 AgentController 均只依赖接口，不依赖具体工具命令。
+
+```python
+class EDAProvider(ABC):
+    @abstractmethod
+    def run_baseline_flow(self, def_file: str, guide_file: str | None) -> str: ...
+    @abstractmethod
+    def run_incremental_route(self, def_file: str, net_list: list[str] | None) -> str: ...
+    @abstractmethod
+    def extract_drc_report(self, def_file: str) -> list[DRCViolation]: ...
+    @abstractmethod
+    def extract_metrics(self, def_file: str) -> RoutingMetrics: ...
+    @abstractmethod
+    def extract_congestion_map(self, def_file: str, resolution: int) -> np.ndarray: ...
+```
+
+**默认实现**：`OpenROADProvider` 封装现有 `RoutingToolkit` 的 Tcl 子进程调用、报告解析和全局/详细布线流程。
+
+**未来扩展**：新增 `CadenceInnovusProvider`、`SynopsysICC2Provider` 等实现时，只需实现上述接口，无需修改 `RoutingAgent`、`PolicyExecutor`、`VisualRenderer` 等上层逻辑。
+
+**配置化切换**：
+
+```yaml
+# config/agent_config.yaml
+eda_provider: openroad   # cadence_innovus / synopsys_icc2 / ...
+
+openroad:
+  exe: /path/to/openroad
+  threads: 8
+
+cadence_innovus:
+  exe: /path/to/innovus
+  license_server: ...
+```
+
+**迁移成本说明**：
+
+| 能力 | OpenROAD | 商业 EDA 差异 |
+|---|---|---|
+| 进程/API 调用 | `openroad -exit script.tcl` | CLI/启动参数/license 模式不同 |
+| 全局/详细布线 | `global_route` / `detailed_route` | 对应 `routeDesign`、`nanoRoute`、`route_opt` 等 |
+| DRC 报告 | `detailed_route -output_drc` | 格式不同，但 `EDAProvider` 负责解析为统一 `DRCViolation` |
+| 增量路由 | 撕 DEF + `detailed_route` | `ecoRoute` 等增量命令，需单独实现 |
+| Blockage/Guide | DEF BLOCKAGES / guide 文件 | 可能需要 `.tdf`、`.gbc`、`.route_guide` 等 |
+
+**关键原则**：DEF/LEF 仍作为通用几何交换格式；几何编辑（`DEFEditor`/`ODBEditor`）和视觉渲染尽量保持 EDA 无关；变化的是命令调用和报告解析。
 
 ---
 
@@ -612,14 +746,16 @@ Persisted violations: 1 (v_0_2)
 - `src/vlm_policy.py`：重写 prompt，加入 DRC 表和 net 特征（保持旧 schema 兼容）。
 - `tests/test_routing_toolkit.py`：增加对应测试。
 
-### Phase 2：DEF 编辑器（2-3 周）
+### Phase 2：DEF 编辑器与 EDA 抽象层（2-3 周）
 - 新建 `src/def_editor.py`。
-- `src/routing_toolkit.py`：增加对 `DEFEditor` 的薄封装。
+- 新建 `src/eda_provider.py` + `src/openroad_provider.py`：把现有 OpenROAD Tcl 调用、报告解析封装为 `EDAProvider` 接口。
+- `src/routing_toolkit.py`：作为 `OpenROADProvider` 的薄封装或逐步迁移。
 - 用合成 DEF 和真实 ISPD DEF 做单元测试。
 
-### Phase 3：PolicyExecutor 与归因（3-4 周）
-- 新建 `src/policy_executor.py`、`src/tcl_generator.py`、`src/attribution_engine.py`。
-- 修改 `src/agent_controller.py`：集成 `PolicyExecutor`、richer state、归因反馈。
+### Phase 3：PolicyExecutor、LocalRouter 与归因（3-4 周）
+- 新建 `src/policy_executor.py`、`src/tcl_generator.py`、`src/attribution_engine.py`、`src/local_router.py`。
+- 实现 `fishbone_route_net` 算子（`src/fishbone_router.py`），接入 `PolicyExecutor`。
+- 修改 `src/agent_controller.py`：集成 `PolicyExecutor`、`EDAProvider`、richer state、归因反馈。
 - 更新 `src/vlm_policy.py` JSON schema 校验。
 
 ### Phase 4：局部评估与 odb（4-5 周）
@@ -673,38 +809,49 @@ Persisted violations: 1 (v_0_2)
 
 | 决策 | 理由 |
 |----------|-----------|
-| 保留 Tcl 子进程做全局 route | 稳定、版本无关、无 odb 依赖。 |
+| 引入 `EDAProvider` 抽象层 | 默认使用 OpenROAD，未来可无缝接入商业 EDA；上层代码不耦合具体工具命令。 |
+| 通过 `EDAProvider` 做全局 route / DRC / metrics | 稳定、版本无关、报告解析由 provider 自己负责。 |
 | 新增 DEF 文本编辑器做细粒度编辑 | 纯 Python、无外部依赖、任何 DEF 都能用。 |
 | 增量引入 `odb` | 更稳健高效，但可选，避免强依赖。 |
 | VLM 作为诊断器 | 结构化 DRC 表 + per-net 特征让 VLM 能推理根因。 |
 | 可归因反馈 | 闭环：VLM 能学习哪些动作修复了哪些违规。 |
 | 局部评估 fallback | 全局 `detailed_route` 始终作为安全 fallback。 |
+| 自研算子 + OpenROAD 精修 | `fishbone_route_net` 等自研算子生成候选拓扑，OpenROAD 负责 DRC 收敛，分工清晰。 |
 
 ---
 
 ## 11. 关键文件清单
 
-- `src/routing_toolkit.py` — 扩展 DRC/net 特征提取。
+- `src/routing_toolkit.py` — 扩展 DRC/net 特征提取（逐步迁移到 OpenROADProvider）。
 - `src/visual_renderer.py` — 局部 violation crop。
-- `src/vlm_policy.py` — 新 prompt 与 schema。
-- `src/agent_controller.py` — 集成 PolicyExecutor 与反馈。
+- `src/vlm_policy.py` — 新 prompt 与 schema（增加 `fishbone_route_net`）。
+- `src/agent_controller.py` — 集成 PolicyExecutor、EDAProvider 与反馈。
+- `src/eda_provider.py` — EDA 后端抽象接口。
+- `src/openroad_provider.py` — OpenROAD 实现（封装现有 Tcl 流程）。
 - `src/def_editor.py` — 新增 DEF 文本编辑器。
+- `src/local_router.py` — 自研局部布线算子接口。
+- `src/fishbone_router.py` — 鱼骨图 net-level 布线算子。
 - `src/policy_executor.py` — 新增动作分发器。
 - `src/attribution_engine.py` — 新增可归因 delta 计算。
-- `src/tcl_generator.py` — 新增 Tcl 脚本生成器。
+- `src/tcl_generator.py` — 新增 Tcl 脚本生成器（可由 OpenROADProvider 使用）。
 - `src/odb_editor.py` — 新增 odb 编辑器（可选）。
 - `scripts/run_agent.py` — 新增 CLI 开关。
-- `config/agent_config.yaml` — 新增配置项。
+- `config/agent_config.yaml` — 新增配置项（含 `eda_provider`）。
 - `tests/test_def_editor.py` — DEFEditor 单元测试。
 - `tests/test_attribution_engine.py` — 归因引擎测试。
+- `tests/test_fishbone_router.py` — FishboneRouter 单元测试。
 
 ---
 
 ## 12. 下一步建议
 
-最优先实现 **Phase 1 + Phase 2 中的 `rip_up_segment` 和 `reassign_layer`**。这样即使其他模块尚未完成，也能在下一轮迭代中验证：
+最优先实现 **Phase 1 + Phase 2 中的 `EDAProvider` 骨架与 `DEFEditor` 的 `rip_up_segment` / `reassign_layer`**。这样即使其他模块尚未完成，也能在下一轮迭代中验证：
 1. VLM 是否能从结构化 DRC 表中诊断出具体 violation。
 2. segment-level 编辑是否能真正修复 baseline 后剩余的 DRC。
-3. 可归因反馈是否帮助 VLM 在后续迭代中做出更好决策。
+3. 通过 `EDAProvider` 切换 OpenROAD 流程是否对上层透明。
 
-待这两个动作稳定后，再逐步加入 `move_via`、`insert_jog`、`change_via_type` 和 odb 局部评估。
+待这两个动作稳定后，再逐步加入：
+- `move_via`、`insert_jog`、`change_via_type`；
+- `fishbone_route_net` 自研算子与 `LocalRouter`；
+- `odb` 局部评估；
+- 后续商业 EDA provider 实现（按需）。

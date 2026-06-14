@@ -14,9 +14,11 @@ import subprocess
 import tempfile
 import shutil
 from pathlib import Path
-from typing import List, Dict, Tuple, Optional, Union
+from typing import List, Dict, Tuple, Optional, Union, Set
 from dataclasses import dataclass, field, asdict
 import numpy as np
+
+from .def_parser import DefParser, DefNet, DefSegment, DefVia
 
 
 @dataclass
@@ -61,7 +63,67 @@ class RoutingState:
     netlist_stats: Optional[Dict] = None
     drc_report: Optional[Dict] = None
     drc_markers: List[Tuple[float, float, str]] = field(default_factory=list)
+    drc_violations: List["DRCViolation"] = field(default_factory=list)
+    net_features: Dict[str, "NetRoutingFeatures"] = field(default_factory=dict)
     iteration: int = 0
+
+
+@dataclass
+class DRCViolation:
+    """Structured DRC violation used for diagnosis and attribution."""
+
+    violation_id: str
+    vtype: str
+    layer: str
+    bbox: Tuple[int, int, int, int]
+    center: Tuple[int, int]
+    nets_involved: List[str] = field(default_factory=list)
+    segment_indices: List[Tuple[str, int]] = field(default_factory=list)
+    severity: float = 1.0
+    description: str = ""
+
+    def to_dict(self) -> Dict:
+        return {
+            "violation_id": self.violation_id,
+            "type": self.vtype,
+            "layer": self.layer,
+            "bbox": self.bbox,
+            "center": self.center,
+            "nets_involved": self.nets_involved,
+            "segment_indices": self.segment_indices,
+            "severity": self.severity,
+            "description": self.description,
+        }
+
+
+@dataclass
+class NetRoutingFeatures:
+    """Per-net routing features fed to the VLM."""
+
+    net_name: str
+    fanout: int = 0
+    hpwl_um: float = 0.0
+    routed_segments: int = 0
+    via_count: int = 0
+    layer_usage: Dict[str, int] = field(default_factory=dict)
+    drc_count: int = 0
+    drc_violation_ids: List[str] = field(default_factory=list)
+    congestion_score: float = 0.0
+    is_critical: bool = False
+
+    def to_dict(self) -> Dict:
+        return {
+            "net_name": self.net_name,
+            "fanout": self.fanout,
+            "hpwl_um": round(self.hpwl_um, 2),
+            "routed_segments": self.routed_segments,
+            "via_count": self.via_count,
+            "layer_usage": self.layer_usage,
+            "drc_count": self.drc_count,
+            "drc_violation_ids": self.drc_violation_ids,
+            "congestion_score": round(self.congestion_score, 2),
+            "is_critical": self.is_critical,
+        }
 
 
 class RoutingToolkit:
@@ -476,9 +538,12 @@ detailed_route -output_drc {drc_rpt} -verbose 0
         drc_data["total_violations"] = len(drc_data["violations"])
         return drc_data
 
-    def extract_metrics(self, def_file: str) -> RoutingMetrics:
+    def extract_metrics(
+        self, def_file: str, drc_data: Optional[Dict] = None
+    ) -> RoutingMetrics:
         """Combine DRC, wirelength, and via metrics into a RoutingMetrics object."""
-        drc_data = self.extract_drc_report(def_file)
+        if drc_data is None:
+            drc_data = self.extract_drc_report(def_file)
         wirelength_rpt = self.work_dir / f"wirelength_{self.iteration}.rpt"
 
         tcl_script = f"""
@@ -556,6 +621,378 @@ report_wire_length -net * -detailed_route -file {wirelength_rpt}
             nets_text,
         )
         return len(vias)
+
+    @staticmethod
+    def _violations_to_drc_data(violations: List[DRCViolation]) -> Dict:
+        """Convert structured DRC violations to the legacy drc_data dict."""
+        drc_data = {
+            "total_violations": len(violations),
+            "spacing": 0,
+            "min_width": 0,
+            "short": 0,
+            "end_of_line": 0,
+            "via_spacing": 0,
+            "corner_spacing": 0,
+            "adjacent_cut_spacing": 0,
+            "min_area": 0,
+            "other": 0,
+            "violations": [v.to_dict() for v in violations],
+        }
+        for v in violations:
+            vtype_lower = v.vtype.lower()
+            if "spacing" in vtype_lower and "via" not in vtype_lower:
+                drc_data["spacing"] += 1
+            elif "minwidth" in vtype_lower or "min_width" in vtype_lower:
+                drc_data["min_width"] += 1
+            elif "short" in vtype_lower:
+                drc_data["short"] += 1
+            elif "endofline" in vtype_lower or "eol" in vtype_lower:
+                drc_data["end_of_line"] += 1
+            elif "via_spacing" in vtype_lower:
+                drc_data["via_spacing"] += 1
+            elif "corner" in vtype_lower:
+                drc_data["corner_spacing"] += 1
+            elif "adjacent_cut" in vtype_lower:
+                drc_data["adjacent_cut_spacing"] += 1
+            elif "minarea" in vtype_lower or "min_area" in vtype_lower:
+                drc_data["min_area"] += 1
+            else:
+                drc_data["other"] += 1
+        return drc_data
+
+    # ------------------------------------------------------------------
+    # Structured state extraction (Redesign Phase 1)
+    # ------------------------------------------------------------------
+
+    def extract_structured_drc_report(
+        self, def_file: str, congestion_map: Optional[np.ndarray] = None
+    ) -> List[DRCViolation]:
+        """
+        Run a DRC check and return a list of structured DRCViolation objects.
+
+        The method parses the OpenROAD DRC report, estimates each violation's
+        bounding box, and cross-references it with DEF NETS segments/vias to
+        identify the nets and segment indices involved.
+        """
+        drc_rpt = self.work_dir / f"drc_structured_{self.iteration}.rpt"
+
+        tcl_script = f"""
+read_lef {self.lef_file}
+read_def {def_file}
+detailed_route -output_drc {drc_rpt} -verbose 0
+"""
+        retcode, stdout, stderr = self._run_tcl_script(tcl_script, timeout=1200)
+
+        if not drc_rpt.exists():
+            return []
+
+        violations = self._parse_structured_drc_report(
+            drc_rpt, def_file, congestion_map
+        )
+        return violations
+
+    def _parse_structured_drc_report(
+        self,
+        drc_rpt: Path,
+        def_file: str,
+        congestion_map: Optional[np.ndarray],
+    ) -> List[DRCViolation]:
+        """Parse the DRC report file into DRCViolation objects."""
+        nets = DefParser.parse_nets(def_file)
+        violations: List[DRCViolation] = []
+
+        # Pre-build segment and via spatial indexes per layer
+        layer_segments: Dict[str, List[Tuple[DefSegment, str]]] = {}
+        layer_vias: Dict[str, List[Tuple[DefVia, str]]] = {}
+        for net_name, net in nets.items():
+            for seg in net.segments:
+                layer_segments.setdefault(seg.layer, []).append((seg, net_name))
+            for via in net.vias:
+                # Index via by both lower and upper layers for matching
+                layer_vias.setdefault(via.layer, []).append((via, net_name))
+
+        with open(drc_rpt, "r") as f:
+            lines = [ln.strip() for ln in f if ln.strip()]
+
+        for idx, line in enumerate(lines):
+            parsed = self._parse_drc_line(line)
+            if parsed is None:
+                continue
+
+            vtype = parsed["type"]
+            layer = parsed.get("layer", "")
+            x = parsed.get("x")
+            y = parsed.get("y")
+            bbox = parsed.get("bbox")
+            desc = parsed.get("description", line)
+
+            if bbox is None and x is not None and y is not None:
+                bbox = self._estimate_violation_bbox(vtype, layer, x, y)
+
+            if bbox is None:
+                continue
+
+            center = ((bbox[0] + bbox[2]) // 2, (bbox[1] + bbox[3]) // 2)
+            v_id = f"v_{self.iteration}_{idx}"
+
+            # Cross-reference with segments/vias
+            nets_involved: Set[str] = set()
+            segment_indices: List[Tuple[str, int]] = []
+
+            search_layers = [layer] if layer else list(layer_segments.keys())
+            for slayer in search_layers:
+                for seg, net_name in layer_segments.get(slayer, []):
+                    if self._bbox_intersects(bbox, seg.bbox, margin=200):
+                        nets_involved.add(net_name)
+                        segment_indices.append((net_name, seg.segment_index))
+
+                for via, net_name in layer_vias.get(slayer, []):
+                    if self._point_in_bbox((via.x, via.y), bbox, margin=500):
+                        nets_involved.add(net_name)
+
+            severity = self._compute_violation_severity(
+                vtype, center, congestion_map
+            )
+
+            violations.append(
+                DRCViolation(
+                    violation_id=v_id,
+                    vtype=vtype,
+                    layer=layer,
+                    bbox=bbox,
+                    center=center,
+                    nets_involved=sorted(nets_involved),
+                    segment_indices=segment_indices,
+                    severity=severity,
+                    description=desc,
+                )
+            )
+
+        return violations
+
+    @staticmethod
+    def _parse_drc_line(line: str) -> Optional[Dict]:
+        """
+        Parse a single DRC report line.
+
+        Supports OpenROAD formats such as:
+          "Short 100500 205000 metal2 Net1 and Net2 short"
+          "spacing 100500 205000 metal3 <description>"
+          "Short metal2 bbox 100000 200000 110000 210000 ..."
+        """
+        # Try bbox format first
+        bbox_match = re.search(
+            r"(\w+)\s+(\S+)\s+bbox\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)",
+            line,
+            re.IGNORECASE,
+        )
+        if bbox_match:
+            return {
+                "type": bbox_match.group(1),
+                "layer": bbox_match.group(2),
+                "bbox": (
+                    int(float(bbox_match.group(3))),
+                    int(float(bbox_match.group(4))),
+                    int(float(bbox_match.group(5))),
+                    int(float(bbox_match.group(6))),
+                ),
+                "description": line,
+            }
+
+        # Standard center-point format
+        match = re.match(
+            r"(\w+)\s+([\d.]+)\s+([\d.]+)\s+(\S+)\s*(.*)", line
+        )
+        if match:
+            return {
+                "type": match.group(1),
+                "x": float(match.group(2)),
+                "y": float(match.group(3)),
+                "layer": match.group(4),
+                "description": match.group(5).strip(),
+            }
+
+        # Loose format: only type keywords
+        lower = line.lower()
+        if "short" in lower:
+            return {"type": "short", "description": line}
+        if "spacing" in lower:
+            return {"type": "spacing", "description": line}
+        return None
+
+    @staticmethod
+    def _estimate_violation_bbox(
+        vtype: str, layer: str, x: float, y: float
+    ) -> Optional[Tuple[int, int, int, int]]:
+        """
+        Estimate a violation bbox from its center point.
+
+        Uses a type-dependent default size because LEF design rules are not
+        parsed here.  The margin is intentionally conservative so that nearby
+        segments are captured for cross-referencing.
+        """
+        ix, iy = int(x), int(y)
+        base_sizes = {
+            "short": 800,
+            "spacing": 600,
+            "min_width": 400,
+            "end_of_line": 500,
+            "via_spacing": 400,
+        }
+        vtype_lower = vtype.lower()
+        size = 400
+        for key, val in base_sizes.items():
+            if key in vtype_lower:
+                size = val
+                break
+
+        return (ix - size, iy - size, ix + size, iy + size)
+
+    @staticmethod
+    def _bbox_intersects(
+        bbox1: Tuple[int, int, int, int],
+        bbox2: Tuple[int, int, int, int],
+        margin: int = 0,
+    ) -> bool:
+        return not (
+            bbox1[2] + margin < bbox2[0] - margin
+            or bbox1[0] - margin > bbox2[2] + margin
+            or bbox1[3] + margin < bbox2[1] - margin
+            or bbox1[1] - margin > bbox2[3] + margin
+        )
+
+    @staticmethod
+    def _point_in_bbox(
+        point: Tuple[int, int],
+        bbox: Tuple[int, int, int, int],
+        margin: int = 0,
+    ) -> bool:
+        x, y = point
+        return (
+            bbox[0] - margin <= x <= bbox[2] + margin
+            and bbox[1] - margin <= y <= bbox[3] + margin
+        )
+
+    def _compute_violation_severity(
+        self,
+        vtype: str,
+        center: Tuple[int, int],
+        congestion_map: Optional[np.ndarray],
+    ) -> float:
+        base_weights = {
+            "short": 10.0,
+            "spacing": 2.0,
+            "min_width": 3.0,
+            "end_of_line": 2.5,
+            "via_spacing": 1.5,
+        }
+        base = 1.0
+        for key, weight in base_weights.items():
+            if key in vtype.lower():
+                base = weight
+                break
+
+        cong_val = self._lookup_congestion(congestion_map, center)
+        return base * (1.0 + cong_val)
+
+    @staticmethod
+    def _lookup_congestion(
+        congestion_map: Optional[np.ndarray], center: Tuple[int, int]
+    ) -> float:
+        if congestion_map is None or congestion_map.size == 0:
+            return 0.0
+
+        h, w = congestion_map.shape
+        die_area = (0, 0, 390800, 383040)  # placeholder; caller should supply scale
+        # Use normalized coordinates assuming the map covers a square-ish design
+        # This is a heuristic; a more accurate mapping uses die_area.
+        cx, cy = center
+        max_dim = max(w, h)
+        px = int((cx / max_dim) % w)
+        py = int((cy / max_dim) % h)
+        px = max(0, min(px, w - 1))
+        py = max(0, min(py, h - 1))
+        return float(congestion_map[py, px])
+
+    def extract_net_routing_features(
+        self,
+        def_file: str,
+        drc_violations: Optional[List[DRCViolation]] = None,
+        congestion_map: Optional[np.ndarray] = None,
+    ) -> Dict[str, NetRoutingFeatures]:
+        """
+        Extract per-net routing features from a DEF file.
+
+        Optionally cross-references DRC violations and congestion map to enrich
+        the features.
+        """
+        nets = DefParser.parse_nets(def_file)
+        die_area = DefParser.parse_die_area(def_file)
+
+        # Map violations to nets
+        net_violations: Dict[str, List[DRCViolation]] = {}
+        if drc_violations:
+            for v in drc_violations:
+                for net_name in v.nets_involved:
+                    net_violations.setdefault(net_name, []).append(v)
+
+        features: Dict[str, NetRoutingFeatures] = {}
+        for net_name, net in nets.items():
+            violations_for_net = net_violations.get(net_name, [])
+            drc_count = len(violations_for_net)
+            drc_ids = [v.violation_id for v in violations_for_net]
+
+            congestion_score = 0.0
+            if congestion_map is not None and net.bbox is not None:
+                congestion_score = self._compute_net_congestion(
+                    congestion_map, net.bbox, die_area
+                )
+
+            is_critical = net.fanout > 50 or net.hpwl_um > 500.0
+
+            features[net_name] = NetRoutingFeatures(
+                net_name=net_name,
+                fanout=net.fanout,
+                hpwl_um=net.hpwl_um,
+                routed_segments=len(net.segments),
+                via_count=len(net.vias),
+                layer_usage=net.layer_usage,
+                drc_count=drc_count,
+                drc_violation_ids=drc_ids,
+                congestion_score=congestion_score,
+                is_critical=is_critical,
+            )
+
+        return features
+
+    @staticmethod
+    def _compute_net_congestion(
+        congestion_map: np.ndarray,
+        net_bbox: Tuple[int, int, int, int],
+        die_area: Optional[Tuple[int, int, int, int]] = None,
+    ) -> float:
+        if congestion_map.size == 0:
+            return 0.0
+
+        h, w = congestion_map.shape
+        if die_area is None:
+            die_area = (0, 0, max(w, h), max(w, h))
+
+        die_w = max(die_area[2] - die_area[0], 1)
+        die_h = max(die_area[3] - die_area[1], 1)
+
+        x1 = int((net_bbox[0] - die_area[0]) / die_w * w)
+        y1 = int((net_bbox[1] - die_area[1]) / die_h * h)
+        x2 = int((net_bbox[2] - die_area[0]) / die_w * w)
+        y2 = int((net_bbox[3] - die_area[1]) / die_h * h)
+
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(w, x2), min(h, y2)
+
+        if x2 <= x1 or y2 <= y1:
+            return 0.0
+
+        return float(congestion_map[y1:y2, x1:x2].mean())
 
     # ------------------------------------------------------------------
     # Routing actions

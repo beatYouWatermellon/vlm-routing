@@ -9,10 +9,6 @@ import sys
 import argparse
 from pathlib import Path
 
-import sys
-import argparse
-from pathlib import Path
-
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.routing_toolkit import RoutingToolkit
@@ -20,6 +16,7 @@ from src.visual_renderer import VisualRenderer
 from src.vlm_policy import VLMPolicyGenerator
 from src.agent_controller import RoutingAgent
 from src.ispd_evaluator import ISPDEvaluator
+from src.utils import load_config
 
 
 def main():
@@ -34,8 +31,11 @@ Examples:
   # ISPD 2019 test1 with custom iterations
   python scripts/run_agent.py --benchmark ispd19_test1 --data-dir ./data/ispd2019 --max-iter 20
 
-  # Use Claude instead of Gemini
-  python scripts/run_agent.py --benchmark ispd18_test1 --vlm-model claude-3-5-sonnet-20241022
+  # Disable fine-grained actions and use only coarse actions
+  python scripts/run_agent.py --benchmark ispd18_test1 --no-fine-actions
+
+  # Use a specific EDA provider
+  python scripts/run_agent.py --benchmark ispd18_test1 --eda-provider openroad
         """
     )
 
@@ -52,12 +52,12 @@ Examples:
         help="Working output directory"
     )
     parser.add_argument(
-        "--max-iter", type=int, default=15,
-        help="Maximum optimization iterations"
+        "--max-iter", type=int, default=None,
+        help="Maximum optimization iterations (overrides config)"
     )
     parser.add_argument(
-        "--patience", type=int, default=5,
-        help="Early stopping patience"
+        "--patience", type=int, default=None,
+        help="Early stopping patience (overrides config)"
     )
     parser.add_argument(
         "--openroad", default="openroad",
@@ -80,8 +80,37 @@ Examples:
         choices=["simplified", "ispd2019", "ispd2018"],
         help="ISPD scoring mode"
     )
+    parser.add_argument(
+        "--enable-fine-actions",
+        action="store_true",
+        default=None,
+        help="Enable fine-grained segment/via/net actions"
+    )
+    parser.add_argument(
+        "--no-fine-actions",
+        action="store_true",
+        help="Disable fine-grained actions (use legacy coarse actions only)"
+    )
+    parser.add_argument(
+        "--eda-provider", default=None,
+        help="EDA provider to use (currently only 'openroad' is supported)"
+    )
 
     args = parser.parse_args()
+
+    # Load configuration and apply CLI overrides
+    config = load_config("config/agent_config.yaml")
+    agent_cfg = config.get("agent", {})
+    vlm_cfg = config.get("vlm", {})
+
+    max_iter = args.max_iter if args.max_iter is not None else agent_cfg.get("max_iterations", 15)
+    patience = args.patience if args.patience is not None else agent_cfg.get("patience", 5)
+
+    enable_fine = agent_cfg.get("enable_fine_actions", True)
+    if args.enable_fine_actions is True:
+        enable_fine = True
+    if args.no_fine_actions:
+        enable_fine = False
 
     data_dir = Path(args.data_dir) / args.benchmark
     lef_file = data_dir / f"{args.benchmark}.lef"
@@ -107,7 +136,8 @@ Examples:
     print(f"  DEF:   {def_file}")
     print(f"  Guide: {guide_file if guide_file.exists() else 'N/A'}")
     print(f"  Work:  {work_dir}")
-    print(f"  VLM:   {args.vlm_model}")
+    print(f"  VLM:   {args.vlm_model or vlm_cfg.get('model', 'default')}")
+    print(f"  Fine actions: {enable_fine}")
     print(f"{'='*60}\n")
 
     print("[Init] Initializing components...")
@@ -124,8 +154,8 @@ Examples:
     )
 
     vlm = VLMPolicyGenerator(
-        model=args.vlm_model,
-        client_type=args.vlm_client,
+        model=args.vlm_model or vlm_cfg.get("model"),
+        client_type=args.vlm_client or vlm_cfg.get("client_type"),
     )
 
     agent = RoutingAgent(
@@ -133,8 +163,10 @@ Examples:
         renderer=renderer,
         vlm=vlm,
         work_dir=str(work_dir),
-        max_iterations=args.max_iter,
-        patience=args.patience,
+        max_iterations=max_iter,
+        patience=patience,
+        enable_fine_actions=enable_fine,
+        local_edit_threshold=agent_cfg.get("local_edit_threshold_nets", 3),
     )
 
     print("\n[Start] Running optimization...\n")

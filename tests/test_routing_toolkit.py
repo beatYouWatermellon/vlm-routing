@@ -1,7 +1,7 @@
 import unittest
 import tempfile
 from pathlib import Path
-from src.routing_toolkit import RoutingToolkit, RoutingMetrics
+from src.routing_toolkit import RoutingToolkit, RoutingMetrics, NetRoutingFeatures
 
 
 class TestRoutingToolkit(unittest.TestCase):
@@ -70,6 +70,26 @@ class TestRoutingToolkitWithData(unittest.TestCase):
 
         cmap = toolkit.extract_congestion_map(def_file, resolution=256)
         self.assertEqual(cmap.shape, (256, 256))
+
+    def test_extract_net_routing_features(self):
+        def_file = "outputs/baseline_test/ispd18_test1/baseline_ispd18_test1.def"
+        if not Path(def_file).exists():
+            self.skipTest(f"Routed DEF not found: {def_file}")
+
+        toolkit = RoutingToolkit(
+            openroad_exe="openroad",
+            work_dir=tempfile.mkdtemp(prefix="test_toolkit_features_"),
+            lef_file="data/ispd2018/ispd18_test1/ispd18_test1.lef",
+        )
+
+        features = toolkit.extract_net_routing_features(def_file)
+        self.assertGreater(len(features), 0)
+
+        net1 = features.get("net1")
+        self.assertIsNotNone(net1)
+        self.assertIsInstance(net1, NetRoutingFeatures)
+        self.assertGreater(net1.routed_segments, 0)
+        self.assertGreaterEqual(net1.via_count, 0)
 
 
 if __name__ == "__main__":

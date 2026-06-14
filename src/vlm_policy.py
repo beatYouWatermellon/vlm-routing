@@ -1,8 +1,9 @@
 """
 src/vlm_policy.py
 
-VLM policy generator. Uses a multimodal LLM to analyze routing state images and
-structured text, then emits a JSON routing optimization policy.
+VLM policy generator for the redesigned routing agent.  Supports both the new
+fine-grained action space and the legacy coarse action space for backward
+compatibility.
 """
 
 import os
@@ -40,67 +41,107 @@ class VLMPolicyGenerator:
     """
     Generate routing optimization policies from visual and textual state.
 
-    Supports Gemini, Anthropic, and OpenAI multimodal APIs. Returns a JSON
-    policy that follows the schema defined in ``SYSTEM_PROMPT``.
+    Supports Gemini, Anthropic, and OpenAI multimodal APIs.  Returns a JSON
+    policy that follows the redesigned schema.
     """
 
-    SYSTEM_PROMPT = """You are an expert digital IC physical design engineer specializing in detailed routing optimization. Your task is to analyze the provided routing state images and metrics, then output an optimization strategy.
+    SYSTEM_PROMPT = """You are an expert digital IC physical design engineer specializing in detailed routing optimization.
+
+## Your Role
+You are a DIAGNOSTICIAN and STRATEGIST, not just an action selector.  For each iteration:
+1. Diagnose the root cause of each DRC violation cluster.
+2. Select the smallest repair action that addresses the root cause.
+3. Prefer segment/via-level edits for isolated violations.
+4. Use net-level rip-up only when a net has >5 violations or spans >3 segments.
+5. Use region-level blockages only for multi-net congestion hotspots.
 
 ## Design Rules Reference
 - Metal layer directions (typical): M1/M3/M5 horizontal, M2/M4/M6 vertical
-- Spacing rules depend on process node; trust the DRC engine
 - Optimization priority: DRC=0 > minimize wirelength > minimize via count
 
-## Available Actions
-You can ONLY output these action types:
-1. "rip_up_reroute": Rip up routing of specified nets and reroute them
-2. "incremental_route": Run incremental detailed route on unconnected nets
-3. "layer_assign": Assign preferred metal layers to net groups (executed via reroute)
-4. "set_blockage": Add temporary routing blockage in congested regions
-5. "terminate": Terminate optimization (when DRC=0 or cannot improve)
+## Available Fine-Grained Actions
+Segment-level:
+- "rip_up_segment": { "net_name", "segment_index", "layer" }
+- "reassign_layer": { "net_name", "segment_index", "from_layer", "to_layer" }
+- "insert_jog": { "net_name", "segment_index", "layer", "jog_point": [x,y], "jog_direction": "horizontal|vertical" }
+
+Via-level:
+- "move_via": { "net_name", "via_index", "old_position": [x,y], "new_position": [x,y], "via_type" }
+- "change_via_type": { "net_name", "via_index", "position": [x,y], "new_type" }
+
+Net-level:
+- "rip_up_net": { "net_name" }
+- "reroute_net_with_constraints": { "net_name", "preferred_layers": [...], "avoid_regions": [{"bbox": [x1,y1,x2,y2], "reason": "..."}] }
+- "fishbone_route_net": { "net_name", "preferred_layers": [...], "trunk_direction": "auto|horizontal|vertical", "max_branches_per_trunk": 50, "obstacle_margin_nm": 200 }
+
+Region-level:
+- "set_routing_blockage": { "bbox": [x1,y1,x2,y2], "layers": [...], "hardness": "soft|hard" }
+- "set_soft_guidance": { "net_name", "guide_points": [[x,y], ...], "layer" }
+- "relax_region": { "bbox": [x1,y1,x2,y2], "layers": [...] }
+
+Control:
+- "terminate": {}
+- "noop": {}
+
+## Legacy Coarse Actions (still accepted)
+- "rip_up_reroute": { "target_nets": [...] }
+- "incremental_route": {}
+- "layer_assign": { "target_nets": [...], "layer_preference": [...] }
+- "set_blockage": { "avoid_regions": [{"bbox": [...], "reason": "..."}], "layer_preference": [...] }
 
 ## Output Format
 Output MUST be valid JSON with this exact schema:
 {
   "routing_policy": {
     "iteration": <integer>,
-    "strategy_type": <string: brief strategy name>,
-    "analysis": <string: 2-3 sentence analysis of current state>,
+    "strategy_type": <string>,
+    "analysis": <string: 2-3 sentence analysis>,
+    "diagnosis": [
+      {
+        "cluster_id": <string>,
+        "root_cause": <string>,
+        "recommended_action": <string>,
+        "confidence": <number 0-1>
+      }
+    ],
     "priority_actions": [
       {
-        "action": <string: one of the 5 types above>,
-        "target_nets": [<string>: net names to act on],
-        "reason": <string: why this action>,
-        "layer_preference": [<string>]: preferred layers (e.g., ["M3", "M4"]),
-        "direction_constraint": <string: "horizontal" | "vertical" | "none">,
-        "avoid_regions": [
-          {"bbox": [x1, y1, x2, y2], "reason": <string>}
-        ]
+        "action": <string>,
+        "parameters": { <action-specific> },
+        "reason": <string>,
+        "expected_impact": <string: "drc_fix" | "wl_reduce" | "via_reduce" | "congestion_relief">
       }
     ],
     "termination_check": <boolean>,
-    "next_state_focus": <string: what to look for in next iteration>
+    "next_state_focus": <string>
   }
 }
 
 ## Rules
-- Target only nets that exist in the netlist statistics
-- Layer preferences must be valid metal layers (M1-M6 typical)
-- Avoid regions must be within chip boundaries [0, 0, 1, 1] normalized
-- Provide clear reasoning for each action
-- If DRC > 0, focus on fixing violations first
-- If DRC == 0, suggest wirelength/via optimization or terminate
+- Target only nets that exist in the netlist statistics.
+- Layer preferences must be valid metal layers (M1-M6 or Metal1-Metal6).
+- Avoid regions must be within chip boundaries in DBU (nanometers).
+- Provide clear reasoning for each action.
+- If DRC > 0, focus on fixing violations first.
+- If DRC == 0, suggest wirelength/via optimization or terminate.
 """
 
     USER_PROMPT_TEMPLATE = """## Current State - Iteration {iteration}
 
-### Visual Inputs (6-panel routing visualization):
-1. [Top-Left] Global Congestion Heatmap: Red regions indicate congestion hotspots
-2. [Top-Center] M3 Routing Layer: Green= routed tracks (horizontal layer)
-3. [Top-Right] M4 Routing Layer: Green= routed tracks (vertical layer)
-4. [Bottom-Left] DRC Violation Map: Colored X markers show violation locations by type
-5. [Bottom-Center] Overlay: R=congestion, G=routing density, B=low congestion
-6. [Bottom-Right] Hotspot Zoom: Close-up of highest congestion region
+### Visual Inputs
+1. [Top-Left] Global Congestion Heatmap
+2. [Top-Center] M3 Routing Layer
+3. [Top-Right] M4 Routing Layer
+4. [Bottom-Left] DRC Violation Map
+5. [Bottom-Center] Congestion + Routing Overlay
+6. [Bottom-Right] Hotspot Zoom
+{violation_crops_note}
+
+### DRC Violation Table (Top {max_violations} by severity)
+{drc_table}
+
+### Per-Net Routing Features (Top {max_nets} by DRC count / criticality)
+{net_features_table}
 
 ### Netlist Statistics:
 - Total nets: {total_nets}
@@ -119,13 +160,13 @@ Output MUST be valid JSON with this exact schema:
   - Short: {drc_short}
   - EndOfLine: {drc_end_of_line}
   - ViaSpacing: {drc_via_spacing}
-- Wirelength: {wirelength:.2f} um ({wirelength_mm:.6f} mm)
+- Wirelength: {wirelength:.2f} um
 - Via Count: {via_count}
 
-### Previous Action: {last_action}
-### Previous Result: DRC {drc_delta:+d}, Wirelength {wl_delta:+.2f}%
+### Previous Action Result
+{previous_action_report}
 
-Please analyze the routing state and output the optimization strategy in the required JSON format.
+Please analyze the routing state, diagnose root causes, and output the optimization strategy in the required JSON format.
 """
 
     def __init__(
@@ -136,7 +177,6 @@ Please analyze the routing state and output the optimization strategy in the req
         retry_delay: float = 2.0,
         temperature: float = 0.1,
     ):
-        # Allow environment defaults for model selection
         if model is None:
             model = os.getenv("ANTHROPIC_MODEL") or os.getenv("OPENAI_MODEL") or "gemini-2.5-flash"
         self.model_name = model
@@ -154,9 +194,6 @@ Please analyze the routing state and output the optimization strategy in the req
             elif "gpt" in lower_model:
                 client_type = "openai"
             else:
-                # Default to anthropic when a model name is provided but ambiguous;
-                # this lets Anthropic-compatible providers such as Kimi work out of
-                # the box when ANTHROPIC_BASE_URL is set.
                 client_type = "anthropic"
 
         self.client_type = client_type
@@ -206,57 +243,22 @@ Please analyze the routing state and output the optimization strategy in the req
         last_action: str = "None",
         last_metrics: Optional[Dict] = None,
         iteration: int = 0,
+        drc_violations: Optional[List] = None,
+        net_features: Optional[Dict] = None,
+        previous_attribution: Optional[Dict] = None,
+        violation_crop_paths: Optional[List[str]] = None,
     ) -> Dict:
         """Build the prompt, call the VLM, parse and validate JSON."""
-        drc_delta = 0
-        wl_delta = 0.0
-        if last_metrics:
-            drc_delta = metrics.get("drc_total", 0) - last_metrics.get("drc_total", 0)
-            prev_wl = last_metrics.get("wirelength", 1)
-            if prev_wl > 0:
-                wl_delta = (
-                    (metrics.get("wirelength", 0) - prev_wl) / prev_wl
-                ) * 100
-
-        hf_nets = netlist_stats.get("high_fanout_nets", [])[:5]
-        hf_list = "\n".join(
-            [
-                f"  - {n['name']}: fanout={n['fanout']}, HPWL={n['hpwl']}um"
-                for n in hf_nets
-            ]
-        )
-
-        ld_nets = netlist_stats.get("long_distance_nets", [])[:5]
-        ld_list = "\n".join(
-            [
-                f"  - {n['name']}: HPWL={n['hpwl']}um, fanout={n['fanout']}"
-                for n in ld_nets
-            ]
-        )
-
-        user_prompt = self.USER_PROMPT_TEMPLATE.format(
-            iteration=iteration,
-            total_nets=netlist_stats.get("total_nets", 0),
-            total_pins=netlist_stats.get("total_pins", 0),
-            component_count=netlist_stats.get("component_count", 0),
-            std_cell_count=netlist_stats.get("std_cell_count", 0),
-            io_pin_count=netlist_stats.get("io_pin_count", 0),
-            high_fanout_count=len(netlist_stats.get("high_fanout_nets", [])),
-            high_fanout_list=hf_list if hf_list else "  None",
-            long_dist_count=len(netlist_stats.get("long_distance_nets", [])),
-            long_dist_list=ld_list if ld_list else "  None",
-            drc_total=metrics.get("drc_total", 0),
-            drc_spacing=metrics.get("drc_spacing", 0),
-            drc_min_width=metrics.get("drc_min_width", 0),
-            drc_short=metrics.get("drc_short", 0),
-            drc_end_of_line=metrics.get("drc_end_of_line", 0),
-            drc_via_spacing=metrics.get("drc_via_spacing", 0),
-            wirelength=metrics.get("wirelength", 0),
-            wirelength_mm=metrics.get("wirelength", 0) / 1e6,
-            via_count=metrics.get("via_count", 0),
+        user_prompt = self._build_user_prompt(
+            netlist_stats=netlist_stats,
+            metrics=metrics,
             last_action=last_action,
-            drc_delta=drc_delta,
-            wl_delta=wl_delta,
+            last_metrics=last_metrics,
+            iteration=iteration,
+            drc_violations=drc_violations,
+            net_features=net_features,
+            previous_attribution=previous_attribution,
+            violation_crop_paths=violation_crop_paths,
         )
 
         for attempt in range(self.max_retries):
@@ -283,6 +285,191 @@ Please analyze the routing state and output the optimization strategy in the req
                     return self._fallback_policy(metrics, iteration)
 
         return self._fallback_policy(metrics, iteration)
+
+    def _build_user_prompt(
+        self,
+        netlist_stats: Dict,
+        metrics: Dict,
+        last_action: str,
+        last_metrics: Optional[Dict],
+        iteration: int,
+        drc_violations: Optional[List],
+        net_features: Optional[Dict],
+        previous_attribution: Optional[Dict],
+        violation_crop_paths: Optional[List[str]],
+    ) -> str:
+        drc_table = self._format_drc_table(drc_violations, max_rows=20)
+        net_features_table = self._format_net_features_table(
+            net_features, max_rows=10
+        )
+
+        hf_nets = netlist_stats.get("high_fanout_nets", [])[:5]
+        hf_list = "\n".join(
+            [
+                f"  - {n['name']}: fanout={n['fanout']}, HPWL={n['hpwl']}um"
+                for n in hf_nets
+            ]
+        )
+
+        ld_nets = netlist_stats.get("long_distance_nets", [])[:5]
+        ld_list = "\n".join(
+            [
+                f"  - {n['name']}: HPWL={n['hpwl']}um, fanout={n['fanout']}"
+                for n in ld_nets
+            ]
+        )
+
+        prev_report = self._format_previous_attribution(
+            last_action, last_metrics, metrics, previous_attribution
+        )
+
+        crops_note = ""
+        if violation_crop_paths:
+            crops_note = (
+                "\nAdditional local crops around top violation clusters are also "
+                f"provided: {', '.join(violation_crop_paths)}"
+            )
+
+        return self.USER_PROMPT_TEMPLATE.format(
+            iteration=iteration,
+            max_violations=20,
+            drc_table=drc_table,
+            max_nets=10,
+            net_features_table=net_features_table,
+            total_nets=netlist_stats.get("total_nets", 0),
+            total_pins=netlist_stats.get("total_pins", 0),
+            component_count=netlist_stats.get("component_count", 0),
+            std_cell_count=netlist_stats.get("std_cell_count", 0),
+            io_pin_count=netlist_stats.get("io_pin_count", 0),
+            high_fanout_count=len(netlist_stats.get("high_fanout_nets", [])),
+            high_fanout_list=hf_list if hf_list else "  None",
+            long_dist_count=len(netlist_stats.get("long_distance_nets", [])),
+            long_dist_list=ld_list if ld_list else "  None",
+            drc_total=metrics.get("drc_total", 0),
+            drc_spacing=metrics.get("drc_spacing", 0),
+            drc_min_width=metrics.get("drc_min_width", 0),
+            drc_short=metrics.get("drc_short", 0),
+            drc_end_of_line=metrics.get("drc_end_of_line", 0),
+            drc_via_spacing=metrics.get("drc_via_spacing", 0),
+            wirelength=metrics.get("wirelength", 0),
+            via_count=metrics.get("via_count", 0),
+            previous_action_report=prev_report,
+            violation_crops_note=crops_note,
+        )
+
+    @staticmethod
+    def _format_drc_table(drc_violations: Optional[List], max_rows: int) -> str:
+        if not drc_violations:
+            return "  No DRC violations."
+
+        lines = [
+            "| ID | Type | Layer | Center (x,y) | Nets Involved | Severity | Description |",
+            "|----|------|-------|--------------|---------------|----------|-------------|",
+        ]
+
+        sorted_v = sorted(
+            drc_violations,
+            key=lambda v: getattr(v, "severity", 1.0),
+            reverse=True,
+        )[:max_rows]
+
+        for v in sorted_v:
+            vtype = getattr(v, "vtype", "unknown")
+            layer = getattr(v, "layer", "")
+            center = getattr(v, "center", (0, 0))
+            nets = ", ".join(getattr(v, "nets_involved", [])) or "unknown"
+            severity = getattr(v, "severity", 1.0)
+            desc = getattr(v, "description", "")[:40]
+            lines.append(
+                f"| {v.violation_id} | {vtype} | {layer} | {center} | {nets} | {severity:.2f} | {desc} |"
+            )
+
+        return "\n".join(lines)
+
+    @staticmethod
+    def _format_net_features_table(
+        net_features: Optional[Dict], max_rows: int
+    ) -> str:
+        if not net_features:
+            return "  No net features available."
+
+        lines = [
+            "| Net | Fanout | HPWL (um) | Segments | Vias | DRCs | Layers | Congestion | Critical |",
+            "|-----|--------|-----------|----------|------|------|--------|------------|----------|",
+        ]
+
+        sorted_nets = sorted(
+            net_features.values(),
+            key=lambda n: (n.drc_count, n.is_critical, n.fanout),
+            reverse=True,
+        )[:max_rows]
+
+        for nf in sorted_nets:
+            layers = ", ".join(
+                f"{k}:{v}" for k, v in list(nf.layer_usage.items())[:3]
+            )
+            lines.append(
+                f"| {nf.net_name} | {nf.fanout} | {nf.hpwl_um:.2f} | "
+                f"{nf.routed_segments} | {nf.via_count} | {nf.drc_count} | "
+                f"{layers} | {nf.congestion_score:.2f} | {nf.is_critical} |"
+            )
+
+        return "\n".join(lines)
+
+    @staticmethod
+    def _format_previous_attribution(
+        last_action: str,
+        last_metrics: Optional[Dict],
+        metrics: Dict,
+        attribution: Optional[Dict],
+    ) -> str:
+        if attribution is None:
+            if last_metrics:
+                drc_delta = metrics.get("drc_total", 0) - last_metrics.get(
+                    "drc_total", 0
+                )
+                wl_delta = metrics.get("wirelength", 0) - last_metrics.get(
+                    "wirelength", 0
+                )
+                via_delta = metrics.get("via_count", 0) - last_metrics.get(
+                    "via_count", 0
+                )
+                return (
+                    f"Last action: {last_action}\n"
+                    f"DRC delta: {drc_delta:+d}, WL delta: {wl_delta:+.2f}, Via delta: {via_delta:+d}"
+                )
+            return f"Last action: {last_action}\nNo previous metrics available."
+
+        lines = [f"Last action: {last_action}"]
+        lines.append(
+            f"Fixed violations: {len(attribution.get('fixed_violations', []))} "
+            f"({', '.join(attribution.get('fixed_violations', []))})"
+        )
+        lines.append(
+            f"New violations: {len(attribution.get('new_violations', []))} "
+            f"({', '.join(attribution.get('new_violations', []))})"
+        )
+        lines.append(
+            f"Moved violations: {len(attribution.get('moved_violations', []))}"
+        )
+        lines.append(
+            f"Persisted violations: {len(attribution.get('persisted_violations', []))}"
+        )
+        lines.append(
+            f"Global DRC delta: {attribution.get('drc_delta', 0):+d}, "
+            f"WL delta: {attribution.get('wirelength_delta', 0):+.2f}, "
+            f"Via delta: {attribution.get('via_delta', 0):+d}"
+        )
+
+        per_net = attribution.get("per_net_drc_delta", {})
+        if per_net:
+            lines.append("Per-net DRC delta:")
+            for net, delta in sorted(
+                per_net.items(), key=lambda x: abs(x[1]), reverse=True
+            )[:5]:
+                lines.append(f"  {net}: {delta:+d}")
+
+        return "\n".join(lines)
 
     def _call_gemini(self, image_paths: List[str], user_prompt: str) -> str:
         from PIL import Image as PILImage
@@ -409,14 +596,13 @@ Please analyze the routing state and output the optimization strategy in the req
                     "iteration": iteration,
                     "strategy_type": "fallback_fix_drc",
                     "analysis": "VLM API failed. Using fallback strategy to fix DRC violations.",
+                    "diagnosis": [],
                     "priority_actions": [
                         {
-                            "action": "rip_up_reroute",
-                            "target_nets": [],
-                            "reason": "Fallback: rip up all nets with DRC violations and reroute",
-                            "layer_preference": [],
-                            "direction_constraint": "none",
-                            "avoid_regions": [],
+                            "action": "rip_up_net",
+                            "parameters": {"net_name": ""},
+                            "reason": "Fallback: no specific net selected",
+                            "expected_impact": "drc_fix",
                         }
                     ],
                     "termination_check": False,
@@ -429,6 +615,7 @@ Please analyze the routing state and output the optimization strategy in the req
                     "iteration": iteration,
                     "strategy_type": "fallback_terminate",
                     "analysis": "DRC is clean. Terminating optimization.",
+                    "diagnosis": [],
                     "priority_actions": [],
                     "termination_check": True,
                     "next_state_focus": "Optimization complete",

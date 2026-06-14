@@ -234,6 +234,189 @@ class VisualRenderer:
 
         return str(output_path)
 
+    def render_violation_crops(
+        self,
+        drc_violations: List,
+        congestion_map: np.ndarray,
+        routing_layers: Dict[str, np.ndarray],
+        iteration: int = 0,
+        max_crops: int = 6,
+        crop_resolution: int = 512,
+    ) -> List[str]:
+        """
+        Render zoomed 512×512 crops around the top violation clusters.
+
+        Each crop shows congestion, routing layers, and DRC markers for that
+        local region.
+        """
+        if not drc_violations:
+            return []
+
+        clusters = self._cluster_violations(drc_violations, congestion_map.shape)
+        clusters = sorted(
+            clusters, key=lambda c: c["total_severity"], reverse=True
+        )[:max_crops]
+
+        image_paths: List[str] = []
+        for cluster_id, cluster in enumerate(clusters):
+            crop_path = self._render_single_violation_crop(
+                cluster_id=cluster_id,
+                cluster=cluster,
+                congestion_map=congestion_map,
+                routing_layers=routing_layers,
+                iteration=iteration,
+                crop_resolution=crop_resolution,
+            )
+            if crop_path:
+                image_paths.append(crop_path)
+
+        return image_paths
+
+    def _cluster_violations(
+        self, violations: List, map_shape: Tuple[int, ...]
+    ) -> List[Dict]:
+        """Grid-based spatial clustering of DRC violations."""
+        h, w = map_shape[:2]
+        grid_size = max(1, int(min(w, h) / 8))
+
+        # Map physical center to grid cell
+        def cell(cx: int, cy: int) -> Tuple[int, int]:
+            return (cx // grid_size, cy // grid_size)
+
+        cells: Dict[Tuple[int, int], List] = {}
+        for v in violations:
+            cx, cy = getattr(v, "center", (0, 0))
+            key = cell(cx, cy)
+            cells.setdefault(key, []).append(v)
+
+        # Merge adjacent cells into clusters
+        visited: set = set()
+        clusters: List[Dict] = []
+
+        for key in cells:
+            if key in visited:
+                continue
+
+            stack = [key]
+            cluster_violations: List = []
+            while stack:
+                cur = stack.pop()
+                if cur in visited:
+                    continue
+                visited.add(cur)
+                cluster_violations.extend(cells.get(cur, []))
+
+                # Check 8-neighbors
+                for dx in (-1, 0, 1):
+                    for dy in (-1, 0, 1):
+                        if dx == 0 and dy == 0:
+                            continue
+                        nxt = (cur[0] + dx, cur[1] + dy)
+                        if nxt in cells and nxt not in visited:
+                            stack.append(nxt)
+
+            total_severity = sum(
+                getattr(v, "severity", 1.0) for v in cluster_violations
+            )
+            clusters.append(
+                {
+                    "violations": cluster_violations,
+                    "total_severity": total_severity,
+                }
+            )
+
+        return clusters
+
+    def _render_single_violation_crop(
+        self,
+        cluster_id: int,
+        cluster: Dict,
+        congestion_map: np.ndarray,
+        routing_layers: Dict[str, np.ndarray],
+        iteration: int,
+        crop_resolution: int,
+    ) -> Optional[str]:
+        violations = cluster["violations"]
+        if not violations:
+            return None
+
+        # Determine crop region in physical DBU
+        xs = [getattr(v, "center", (0, 0))[0] for v in violations]
+        ys = [getattr(v, "center", (0, 0))[1] for v in violations]
+        margin = max(max(xs) - min(xs), max(ys) - min(ys), 2000) // 2 + 1000
+
+        cx = (min(xs) + max(xs)) // 2
+        cy = (min(ys) + max(ys)) // 2
+        x1 = cx - margin
+        y1 = cy - margin
+        x2 = cx + margin
+        y2 = cy + margin
+
+        h, w = congestion_map.shape
+        # Map physical to grid indices (heuristic: assume map covers design)
+        # Use the design die area if available; otherwise fall back to max coord.
+        max_dim = max(max(xs + ys + [1]), max(w, h))
+        gx1 = max(0, int(x1 / max_dim * w))
+        gy1 = max(0, int(y1 / max_dim * h))
+        gx2 = min(w, int(x2 / max_dim * w))
+        gy2 = min(h, int(y2 / max_dim * h))
+
+        if gx2 <= gx1 or gy2 <= gy1:
+            return None
+
+        fig, axes = plt.subplots(1, 3, figsize=(15, 5), dpi=150)
+        fig.patch.set_facecolor("#1a1a2e")
+
+        # Congestion crop
+        ax = axes[0]
+        crop = congestion_map[gy1:gy2, gx1:gx2]
+        ax.imshow(crop, cmap=self.congestion_cmap, interpolation="nearest")
+        ax.set_title(f"Cluster {cluster_id} Congestion", color="white")
+        ax.axis("off")
+
+        # Routing overlay crop
+        ax = axes[1]
+        overlay = np.zeros((gy2 - gy1, gx2 - gx1, 3), dtype=np.float32)
+        for layer_name, layer_map in routing_layers.items():
+            if layer_map is not None and layer_map.shape == (h, w):
+                layer_crop = layer_map[gy1:gy2, gx1:gx2]
+                overlay[:, :, 1] = np.maximum(overlay[:, :, 1], layer_crop)
+        overlay[:, :, 0] = np.clip(
+            crop / max(crop.max(), 0.1), 0, 1
+        ) if crop.size > 0 else 0
+        ax.imshow(overlay, interpolation="nearest")
+        ax.set_title(f"Cluster {cluster_id} Routing", color="white")
+        ax.axis("off")
+
+        # DRC markers crop
+        ax = axes[2]
+        ax.imshow(crop, cmap="gray", interpolation="nearest")
+        for vtype, color in self.drc_color_map.items():
+            pts = [
+                (getattr(v, "center", (0, 0))[0], getattr(v, "center", (0, 0))[1])
+                for v in violations
+                if getattr(v, "vtype", "other").lower() == vtype
+            ]
+            if pts:
+                px = [(p[0] / max_dim * w - gx1) for p in pts]
+                py = [(p[1] / max_dim * h - gy1) for p in pts]
+                ax.scatter(px, py, c=color, s=50, marker="x", label=vtype)
+        ax.set_title(f"Cluster {cluster_id} DRC ({len(violations)})", color="white")
+        ax.axis("off")
+        ax.legend(facecolor="black", labelcolor="white", fontsize=7)
+
+        plt.tight_layout()
+        output_path = (
+            self.output_dir
+            / f"violation_crop_{cluster_id}_iter_{iteration:03d}.png"
+        )
+        plt.savefig(
+            output_path, dpi=150, bbox_inches="tight", facecolor=fig.get_facecolor()
+        )
+        plt.close(fig)
+
+        return str(output_path)
+
     # ------------------------------------------------------------------
     # Internal rendering helpers
     # ------------------------------------------------------------------

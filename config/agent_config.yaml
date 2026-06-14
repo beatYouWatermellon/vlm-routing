@@ -4,6 +4,8 @@ agent:
   max_iterations: 20
   patience: 5
   checkpoint_interval: 1
+  enable_fine_actions: true
+  local_edit_threshold_nets: 3
 
 vlm:
   # Primary model. For Kimi via the Anthropic-compatible endpoint, set
@@ -16,6 +18,8 @@ vlm:
   max_retries: 3
   retry_delay: 2.0
   timeout: 120
+
+eda_provider: openroad
 
 openroad:
   exe: "openroad"
@@ -34,6 +38,7 @@ visualization:
     - "M3"
     - "M4"
     - "M5"
+  max_violation_crops: 6
 
 evaluation:
   scoring_mode: "simplified"
