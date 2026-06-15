@@ -92,5 +92,8 @@ class OpenROADProvider(EDAProvider):
         bbox: Tuple[int, int, int, int],
         layers: List[str],
         output_name: Optional[str] = None,
+        hardness: str = "hard",
     ) -> str:
-        return self.toolkit.set_routing_blockage(def_file, bbox, layers, output_name)
+        return self.toolkit.set_routing_blockage(
+            def_file, bbox, layers, output_name, hardness=hardness
+        )

@@ -9,10 +9,6 @@ import sys
 import argparse
 from pathlib import Path
 
-import sys
-import argparse
-from pathlib import Path
-
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.routing_toolkit import RoutingToolkit
@@ -59,6 +55,40 @@ def main():
     evaluator = ISPDEvaluator(str(output_dir / "evaluation"))
     score = evaluator.compute_score(metrics, args.scoring_mode)
     print(f"  Score: {score:.2f}")
+
+    # Save a report in the same schema as the agent run so compare_runs.py
+    # can read it.  For a baseline-only run, baseline == optimized.
+    report = {
+        "benchmark": args.benchmark,
+        "scoring_mode": args.scoring_mode,
+        "baseline": {
+            "drc_total": metrics.drc_total,
+            "drc_breakdown": metrics.drc_breakdown,
+            "wirelength_um": metrics.wirelength,
+            "via_count": metrics.via_count,
+            "score": score,
+        },
+        "optimized": {
+            "drc_total": metrics.drc_total,
+            "drc_breakdown": metrics.drc_breakdown,
+            "wirelength_um": metrics.wirelength,
+            "via_count": metrics.via_count,
+            "score": score,
+        },
+        "improvement": {
+            "score_pct": 0.0,
+            "drc_delta": 0,
+            "wl_delta_um": 0.0,
+            "via_delta": 0,
+        },
+        "conclusion": "Baseline only",
+    }
+    report_path = output_dir / "evaluation" / f"{args.benchmark}_report.json"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    import json
+    with open(report_path, "w") as f:
+        json.dump(report, f, indent=2)
+    print(f"  Report: {report_path}")
 
 
 if __name__ == "__main__":

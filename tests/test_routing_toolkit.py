@@ -1,6 +1,7 @@
 import unittest
 import tempfile
 from pathlib import Path
+import numpy as np
 from src.routing_toolkit import RoutingToolkit, RoutingMetrics, NetRoutingFeatures
 
 
@@ -39,6 +40,25 @@ class TestRoutingToolkit(unittest.TestCase):
         die_area = self.toolkit._parse_die_area(path)
         self.assertEqual(die_area, (0, 0, 100000, 200000))
         Path(path).unlink()
+
+    def test_lookup_congestion_with_die_area(self):
+        cmap = np.zeros((10, 10), dtype=np.float32)
+        cmap[5, 5] = 3.0
+        # Physical center at the middle of a 1000x1000 die area should map to
+        # grid cell (5, 5) in a 10x10 congestion map.
+        value = RoutingToolkit._lookup_congestion(
+            cmap, (500, 500), die_area=(0, 0, 1000, 1000)
+        )
+        self.assertEqual(value, 3.0)
+
+    def test_lookup_congestion_out_of_bounds(self):
+        cmap = np.zeros((10, 10), dtype=np.float32)
+        cmap[9, 9] = 2.0
+        # Physical coordinate outside the die area should clamp to the edge.
+        value = RoutingToolkit._lookup_congestion(
+            cmap, (2000, 2000), die_area=(0, 0, 1000, 1000)
+        )
+        self.assertEqual(value, 2.0)
 
 
 class TestRoutingToolkitWithData(unittest.TestCase):

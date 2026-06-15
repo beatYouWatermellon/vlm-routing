@@ -82,6 +82,16 @@ END LIBRARY
         self.assertIn("ROUTED", route)
         self.assertIn("Metal3", route)
 
+    def test_fishbone_inserts_vias(self):
+        router = FishboneRouter(str(self.def_path), str(self.lef_path))
+        route = router.fishbone_route_net("net1")
+        self.assertIsNotNone(route)
+        # Trunk and branch are on different layers, so vias must be present.
+        self.assertIn("VIA", route)
+        # Each branch should terminate at the trunk with a via.
+        via_count = route.count("VIA")
+        self.assertGreaterEqual(via_count, 1)
+
     def test_fishbone_unknown_net(self):
         router = FishboneRouter(str(self.def_path), str(self.lef_path))
         route = router.fishbone_route_net("nonexistent")

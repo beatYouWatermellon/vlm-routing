@@ -79,6 +79,13 @@ Region-level:
 - "set_soft_guidance": { "net_name", "guide_points": [[x,y], ...], "layer" }
 - "relax_region": { "bbox": [x1,y1,x2,y2], "layers": [...] }
 
+Composite / Strategy-level:
+- "route_in_box": { "bbox": [x1,y1,x2,y2], "target_nets": [...], "preferred_layers": [...] }
+- "route_channel": { "bbox": [x1,y1,x2,y2], "target_nets": [...], "preferred_layers": [...] }
+- "route_repair": { "violation_ids": [...] }
+- "optimize_congestion": { "bbox": [x1,y1,x2,y2], "affected_nets": [...], "layers": [...] }
+- "cleanup_routing": {}
+
 Control:
 - "terminate": {}
 - "noop": {}
@@ -199,6 +206,10 @@ Please analyze the routing state, diagnose root causes, and output the optimizat
         self.client_type = client_type
         self._init_client()
 
+        # Track actions that failed or were rolled back so the fallback policy
+        # and future prompts can avoid them.
+        self.blacklisted_actions: List[Dict] = []
+
     def _init_client(self):
         if self.client_type == "gemini":
             api_key = os.getenv("GEMINI_API_KEY")
@@ -247,8 +258,12 @@ Please analyze the routing state, diagnose root causes, and output the optimizat
         net_features: Optional[Dict] = None,
         previous_attribution: Optional[Dict] = None,
         violation_crop_paths: Optional[List[str]] = None,
+        update_blacklist_from_attribution: bool = True,
     ) -> Dict:
         """Build the prompt, call the VLM, parse and validate JSON."""
+        if update_blacklist_from_attribution and previous_attribution:
+            self.update_blacklist(previous_attribution.get("action_results", []))
+
         user_prompt = self._build_user_prompt(
             netlist_stats=netlist_stats,
             metrics=metrics,
@@ -286,6 +301,18 @@ Please analyze the routing state, diagnose root causes, and output the optimizat
 
         return self._fallback_policy(metrics, iteration)
 
+    def update_blacklist(self, action_results: List[Dict]):
+        """Add failed or rolled-back actions to the internal blacklist."""
+        for entry in action_results or []:
+            if not entry.get("success") or entry.get("rolled_back"):
+                self.blacklisted_actions.append(
+                    {
+                        "action": entry.get("action"),
+                        "parameters": entry.get("parameters", {}),
+                        "reason": entry.get("error") or entry.get("local_check_detail"),
+                    }
+                )
+
     def _build_user_prompt(
         self,
         netlist_stats: Dict,
@@ -320,7 +347,11 @@ Please analyze the routing state, diagnose root causes, and output the optimizat
         )
 
         prev_report = self._format_previous_attribution(
-            last_action, last_metrics, metrics, previous_attribution
+            last_action,
+            last_metrics,
+            metrics,
+            previous_attribution,
+            self.blacklisted_actions,
         )
 
         crops_note = ""
@@ -422,6 +453,7 @@ Please analyze the routing state, diagnose root causes, and output the optimizat
         last_metrics: Optional[Dict],
         metrics: Dict,
         attribution: Optional[Dict],
+        blacklisted_actions: Optional[List[Dict]] = None,
     ) -> str:
         if attribution is None:
             if last_metrics:
@@ -468,6 +500,26 @@ Please analyze the routing state, diagnose root causes, and output the optimizat
                 per_net.items(), key=lambda x: abs(x[1]), reverse=True
             )[:5]:
                 lines.append(f"  {net}: {delta:+d}")
+
+        action_results = attribution.get("action_results", [])
+        if action_results:
+            success_rate = attribution.get("action_success_rate", 0.0)
+            lines.append(f"Action success rate: {success_rate:.0%}")
+            failed_summary = attribution.get("failed_action_summary", {})
+            if failed_summary:
+                lines.append("Failed/rolled-back action types:")
+                for action_type, count in sorted(
+                    failed_summary.items(), key=lambda x: x[1], reverse=True
+                ):
+                    lines.append(f"  - {action_type}: {count}")
+
+        if blacklisted_actions:
+            lines.append("Avoid repeating these recent failed actions:")
+            for entry in blacklisted_actions[-5:]:
+                action = entry.get("action", "unknown")
+                params = entry.get("parameters", {})
+                reason = entry.get("reason", "")
+                lines.append(f"  - {action}({params}): {reason}")
 
         return "\n".join(lines)
 
@@ -591,20 +643,39 @@ Please analyze the routing state, diagnose root causes, and output the optimizat
         drc_total = metrics.get("drc_total", 999)
 
         if drc_total > 0:
+            # Avoid recently blacklisted fallback actions.
+            blacklisted_types = {
+                entry.get("action") for entry in self.blacklisted_actions
+            }
+            if "incremental_route" not in blacklisted_types:
+                fallback_action = {
+                    "action": "incremental_route",
+                    "parameters": {},
+                    "reason": "Fallback: re-run detailed route without edits",
+                    "expected_impact": "drc_fix",
+                }
+            elif "rip_up_reroute" not in blacklisted_types:
+                fallback_action = {
+                    "action": "rip_up_reroute",
+                    "parameters": {},
+                    "reason": "Fallback: rip-up and reroute without a specific net",
+                    "expected_impact": "drc_fix",
+                }
+            else:
+                fallback_action = {
+                    "action": "noop",
+                    "parameters": {},
+                    "reason": "Fallback: all safe actions recently failed",
+                    "expected_impact": "drc_fix",
+                }
+
             return {
                 "routing_policy": {
                     "iteration": iteration,
                     "strategy_type": "fallback_fix_drc",
                     "analysis": "VLM API failed. Using fallback strategy to fix DRC violations.",
                     "diagnosis": [],
-                    "priority_actions": [
-                        {
-                            "action": "rip_up_net",
-                            "parameters": {"net_name": ""},
-                            "reason": "Fallback: no specific net selected",
-                            "expected_impact": "drc_fix",
-                        }
-                    ],
+                    "priority_actions": [fallback_action],
                     "termination_check": False,
                     "next_state_focus": "Check if DRC count decreased",
                 }

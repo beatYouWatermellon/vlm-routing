@@ -322,8 +322,9 @@ class DefParser:
 
         header_text = "\n".join(header_lines)
 
-        # Parse pins and their coordinates from the header
-        pin_matches = re.findall(r"\(\s*(\S+)\s+(\S+)\s*\)", header_text)
+        # Parse pins and their coordinates from the header.
+        # Component/pin pairs contain non-numeric tokens; coordinates are numeric.
+        pin_matches = re.findall(r"\(\s*([^\s\d.][^\s]*)\s+([^\s\d.][^\s]*)\s*\)", header_text)
         for comp, pin in pin_matches:
             net.pins.append((comp, pin))
 

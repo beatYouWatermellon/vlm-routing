@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from src.routing_toolkit import RoutingToolkit
 from src.visual_renderer import VisualRenderer
 from src.vlm_policy import VLMPolicyGenerator
+from src.heuristic_policy import HeuristicPolicyGenerator
 from src.agent_controller import RoutingAgent
 from src.ispd_evaluator import ISPDEvaluator
 from src.utils import load_config
@@ -92,6 +93,17 @@ Examples:
         help="Disable fine-grained actions (use legacy coarse actions only)"
     )
     parser.add_argument(
+        "--enable-local-eval",
+        action="store_true",
+        default=None,
+        help="Enable local DRC evaluation for small fine-grained edits"
+    )
+    parser.add_argument(
+        "--heuristic-policy",
+        action="store_true",
+        help="Use deterministic heuristic policy instead of VLM (no API key needed)"
+    )
+    parser.add_argument(
         "--eda-provider", default=None,
         help="EDA provider to use (currently only 'openroad' is supported)"
     )
@@ -111,6 +123,10 @@ Examples:
         enable_fine = True
     if args.no_fine_actions:
         enable_fine = False
+
+    enable_local_eval = agent_cfg.get("enable_local_eval", False)
+    if args.enable_local_eval is True:
+        enable_local_eval = True
 
     data_dir = Path(args.data_dir) / args.benchmark
     lef_file = data_dir / f"{args.benchmark}.lef"
@@ -138,6 +154,7 @@ Examples:
     print(f"  Work:  {work_dir}")
     print(f"  VLM:   {args.vlm_model or vlm_cfg.get('model', 'default')}")
     print(f"  Fine actions: {enable_fine}")
+    print(f"  Local eval: {enable_local_eval}")
     print(f"{'='*60}\n")
 
     print("[Init] Initializing components...")
@@ -153,10 +170,13 @@ Examples:
         resolution=args.resolution,
     )
 
-    vlm = VLMPolicyGenerator(
-        model=args.vlm_model or vlm_cfg.get("model"),
-        client_type=args.vlm_client or vlm_cfg.get("client_type"),
-    )
+    if args.heuristic_policy:
+        vlm = HeuristicPolicyGenerator()
+    else:
+        vlm = VLMPolicyGenerator(
+            model=args.vlm_model or vlm_cfg.get("model"),
+            client_type=args.vlm_client or vlm_cfg.get("client_type"),
+        )
 
     agent = RoutingAgent(
         toolkit=toolkit,
@@ -167,6 +187,7 @@ Examples:
         patience=patience,
         enable_fine_actions=enable_fine,
         local_edit_threshold=agent_cfg.get("local_edit_threshold_nets", 3),
+        enable_local_eval=enable_local_eval,
     )
 
     print("\n[Start] Running optimization...\n")
@@ -176,7 +197,7 @@ Examples:
     )
 
     baseline_metrics = None
-    baseline_json = work_dir / "checkpoints" / "iter_-001.json"
+    baseline_json = work_dir / "checkpoints" / "iter_-0001.json"
     if baseline_json.exists():
         import json as _json
         with open(baseline_json) as f:

@@ -25,6 +25,8 @@ class AttributionReport:
     persisted_violations: List[str] = field(default_factory=list)
     per_net_drc_delta: Dict[str, int] = field(default_factory=dict)
     action_results: List[Dict] = field(default_factory=list)
+    action_success_rate: float = 0.0
+    failed_action_summary: Dict[str, int] = field(default_factory=dict)
 
     def to_dict(self) -> Dict:
         return {
@@ -37,6 +39,8 @@ class AttributionReport:
             "persisted_violations": self.persisted_violations,
             "per_net_drc_delta": self.per_net_drc_delta,
             "action_results": self.action_results,
+            "action_success_rate": self.action_success_rate,
+            "failed_action_summary": self.failed_action_summary,
         }
 
 
@@ -107,6 +111,19 @@ class AttributionEngine:
             for net in all_nets
         }
 
+        # Summarize action success from the execution report.
+        action_results = execution_report or []
+        total_actions = len(action_results)
+        successful_actions = sum(1 for a in action_results if a.get("success"))
+        success_rate = (
+            successful_actions / total_actions if total_actions > 0 else 0.0
+        )
+        failed_summary: Dict[str, int] = {}
+        for a in action_results:
+            if not a.get("success") or a.get("rolled_back"):
+                key = a.get("action", "unknown")
+                failed_summary[key] = failed_summary.get(key, 0) + 1
+
         return AttributionReport(
             drc_delta=new_metrics.drc_total - prev_metrics.drc_total,
             wirelength_delta=new_metrics.wirelength - prev_metrics.wirelength,
@@ -116,7 +133,9 @@ class AttributionEngine:
             moved_violations=sorted(moved),
             persisted_violations=sorted(persisted),
             per_net_drc_delta=per_net_delta,
-            action_results=execution_report or [],
+            action_results=action_results,
+            action_success_rate=success_rate,
+            failed_action_summary=failed_summary,
         )
 
     @staticmethod

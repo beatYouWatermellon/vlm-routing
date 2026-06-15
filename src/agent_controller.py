@@ -13,6 +13,7 @@ from pathlib import Path
 from dataclasses import asdict
 
 from .routing_toolkit import RoutingToolkit, RoutingMetrics, RoutingState
+from .def_parser import DefParser
 from .openroad_provider import OpenROADProvider
 from .policy_executor import PolicyExecutor
 from .attribution_engine import AttributionEngine
@@ -39,6 +40,7 @@ class RoutingAgent:
         patience: int = 5,
         enable_fine_actions: bool = True,
         local_edit_threshold: int = 3,
+        enable_local_eval: bool = False,
     ):
         self.toolkit = toolkit
         self.renderer = renderer
@@ -48,6 +50,7 @@ class RoutingAgent:
         self.max_iterations = max_iterations
         self.patience = patience
         self.enable_fine_actions = enable_fine_actions
+        self.enable_local_eval = enable_local_eval
 
         self.history: List[Tuple[str, RoutingMetrics, str, Optional[Dict]]] = []
         self.current_def: Optional[str] = None
@@ -64,6 +67,8 @@ class RoutingAgent:
             self.provider,
             enable_fine_actions=enable_fine_actions,
             local_edit_threshold_nets=local_edit_threshold,
+            enable_local_eval=enable_local_eval,
+            local_eval_work_dir=str(self.work_dir / "local_eval"),
         )
         self.attribution_engine = AttributionEngine()
         self.last_attribution: Optional[Dict] = None
@@ -114,6 +119,8 @@ class RoutingAgent:
 
             print("  [Step 1/5] Extracting rich state...")
             state = self._extract_state(self.current_def)
+            self.current_violations = state.drc_violations
+            self.current_net_features = state.net_features
 
             print("  [Step 2/5] Rendering visual state...")
             image_paths = self._render_visual_state(state, iteration)
@@ -153,6 +160,8 @@ class RoutingAgent:
                 policy,
                 self.current_violations,
                 self.current_net_features,
+                current_metrics=self.current_metrics,
+                metrics_callback=lambda d: self.provider.extract_metrics(d),
             )
 
             print("  [Step 5/5] Evaluating and attributing result...")
@@ -288,6 +297,7 @@ class RoutingAgent:
             netlist_stats=state.netlist_stats,
             metrics=metrics_dict,
             iteration=iteration,
+            die_area=DefParser.parse_die_area(state.def_file),
         )
 
         images = [main_image]
@@ -299,6 +309,7 @@ class RoutingAgent:
             routing_layers=state.routing_layers,
             iteration=iteration,
             max_crops=6,
+            die_area=DefParser.parse_die_area(state.def_file),
         )
         images.extend(crop_paths)
 
@@ -330,9 +341,16 @@ class RoutingAgent:
         checkpoint_dir = self.work_dir / "checkpoints"
         checkpoint_dir.mkdir(exist_ok=True)
 
-        shutil.copy(def_file, checkpoint_dir / f"iter_{iteration:03d}.def")
+        # Negative iteration -1 is the baseline; format as iter_-0001 so it
+        # sorts predictably and matches the loader in run_agent.py.
+        if iteration < 0:
+            tag = f"iter_-{-iteration:04d}"
+        else:
+            tag = f"iter_{iteration:04d}"
 
-        with open(checkpoint_dir / f"iter_{iteration:03d}.json", "w") as f:
+        shutil.copy(def_file, checkpoint_dir / f"{tag}.def")
+
+        with open(checkpoint_dir / f"{tag}.json", "w") as f:
             json.dump(asdict(metrics), f, indent=2)
 
 

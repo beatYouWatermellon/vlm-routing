@@ -82,6 +82,7 @@ class EDAProvider(ABC):
         bbox: Tuple[int, int, int, int],
         layers: List[str],
         output_name: Optional[str] = None,
+        hardness: str = "hard",
     ) -> str:
         """Insert a routing blockage into the DEF and return the new path."""
         ...

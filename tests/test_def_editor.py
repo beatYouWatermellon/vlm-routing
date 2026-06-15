@@ -20,7 +20,7 @@ NETS 2 ;
   NEW Metal3 ( 3000 3000 ) ( * 4000 ) VIA23_1C
   ;
 - net2 ( comp3 Y ) ( comp4 A )
-  + ROUTED Metal2 ( 5000 5000 ) ( 7000 * ) VIA12_1C_V
+  + ROUTED Metal2 ( 5000 5000 ) ( 3000 3000 ) VIA23_1C
   ;
 END NETS
 END DESIGN
@@ -61,8 +61,35 @@ END DESIGN
         self.assertTrue(Path(out).exists())
 
         new_content = Path(out).read_text()
-        self.assertIn("VIA23_2C", new_content)
-        self.assertNotIn("VIA23_1C", new_content)
+        net1_idx = new_content.find("- net1")
+        net2_idx = new_content.find("- net2")
+        net1_block = new_content[net1_idx:net2_idx]
+        net2_block = new_content[net2_idx:]
+
+        self.assertIn("VIA23_2C", net1_block)
+        self.assertNotIn("VIA23_1C", net1_block)
+        self.assertIn("VIA23_1C", net2_block)
+
+    def test_change_via_type_does_not_affect_other_nets(self):
+        """Via replacement must be scoped to the target net."""
+        # net1 and net2 both have a via at (3000 3000) named VIA23_1C.
+        editor = DEFEditor(str(self.def_path))
+        out = editor.change_via_type("net1", via_index=0, new_type="VIA23_2C")
+        self.assertTrue(Path(out).exists())
+
+        new_content = Path(out).read_text()
+        net1_idx = new_content.find("- net1")
+        net2_idx = new_content.find("- net2")
+        self.assertNotEqual(net1_idx, -1)
+        self.assertNotEqual(net2_idx, -1)
+
+        net1_block = new_content[net1_idx:net2_idx]
+        net2_block = new_content[net2_idx:]
+
+        self.assertIn("VIA23_2C", net1_block)
+        self.assertNotIn("VIA23_1C", net1_block)
+        self.assertIn("VIA23_1C", net2_block)
+        self.assertNotIn("VIA23_2C", net2_block)
 
     def test_replace_net_routing(self):
         editor = DEFEditor(str(self.def_path))

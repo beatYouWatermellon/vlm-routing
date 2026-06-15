@@ -53,6 +53,7 @@ class VisualRenderer:
         metrics: Optional[Dict] = None,
         iteration: int = 0,
         focus_region: Optional[Tuple[int, int, int, int]] = None,
+        die_area: Optional[Tuple[int, int, int, int]] = None,
     ) -> str:
         """Render the full routing state and return the PNG file path."""
         fig = plt.figure(figsize=(18, 12), dpi=150)
@@ -98,7 +99,9 @@ class VisualRenderer:
         ax3.set_title("M4 Routing Layer", fontsize=11, color="white", fontweight="bold")
 
         ax4 = plt.subplot(2, 3, 4)
-        self._render_drc_markers(ax4, drc_markers, congestion_map.shape)
+        self._render_drc_markers(
+            ax4, drc_markers, congestion_map.shape, die_area=die_area
+        )
         ax4.set_title(
             f"DRC Violations (Total: {len(drc_markers)})",
             fontsize=11, color="white", fontweight="bold"
@@ -242,6 +245,7 @@ class VisualRenderer:
         iteration: int = 0,
         max_crops: int = 6,
         crop_resolution: int = 512,
+        die_area: Optional[Tuple[int, int, int, int]] = None,
     ) -> List[str]:
         """
         Render zoomed 512×512 crops around the top violation clusters.
@@ -266,6 +270,7 @@ class VisualRenderer:
                 routing_layers=routing_layers,
                 iteration=iteration,
                 crop_resolution=crop_resolution,
+                die_area=die_area,
             )
             if crop_path:
                 image_paths.append(crop_path)
@@ -335,6 +340,7 @@ class VisualRenderer:
         routing_layers: Dict[str, np.ndarray],
         iteration: int,
         crop_resolution: int,
+        die_area: Optional[Tuple[int, int, int, int]] = None,
     ) -> Optional[str]:
         violations = cluster["violations"]
         if not violations:
@@ -353,13 +359,10 @@ class VisualRenderer:
         y2 = cy + margin
 
         h, w = congestion_map.shape
-        # Map physical to grid indices (heuristic: assume map covers design)
-        # Use the design die area if available; otherwise fall back to max coord.
-        max_dim = max(max(xs + ys + [1]), max(w, h))
-        gx1 = max(0, int(x1 / max_dim * w))
-        gy1 = max(0, int(y1 / max_dim * h))
-        gx2 = min(w, int(x2 / max_dim * w))
-        gy2 = min(h, int(y2 / max_dim * h))
+        # Map physical to grid indices using the design die area when available.
+        gx1, gy1, gx2, gy2 = self._physical_bbox_to_grid(
+            (x1, y1, x2, y2), w, h, die_area
+        )
 
         if gx2 <= gx1 or gy2 <= gy1:
             return None
@@ -398,8 +401,9 @@ class VisualRenderer:
                 if getattr(v, "vtype", "other").lower() == vtype
             ]
             if pts:
-                px = [(p[0] / max_dim * w - gx1) for p in pts]
-                py = [(p[1] / max_dim * h - gy1) for p in pts]
+                px, py = self._physical_to_grid(pts, w, h, die_area)
+                px = [p - gx1 for p in px]
+                py = [p - gy1 for p in py]
                 ax.scatter(px, py, c=color, s=50, marker="x", label=vtype)
         ax.set_title(f"Cluster {cluster_id} DRC ({len(violations)})", color="white")
         ax.axis("off")
@@ -466,7 +470,11 @@ class VisualRenderer:
             )
 
     def _render_drc_markers(
-        self, ax, drc_markers: List[Tuple], map_shape: Tuple[int, int]
+        self,
+        ax,
+        drc_markers: List[Tuple],
+        map_shape: Tuple[int, int],
+        die_area: Optional[Tuple[int, int, int, int]] = None,
     ):
         ax.set_facecolor("black")
         h, w = map_shape
@@ -490,11 +498,10 @@ class VisualRenderer:
             type_groups.setdefault(vtype, []).append((x, y))
 
         for vtype, coords in type_groups.items():
-            xs = [c[0] for c in coords]
-            ys = [c[1] for c in coords]
+            px, py = self._physical_to_grid(coords, w, h, die_area)
             color = self.drc_color_map.get(vtype, "white")
             ax.scatter(
-                xs, ys, c=color, s=20, alpha=0.8,
+                px, py, c=color, s=20, alpha=0.8,
                 label=f"{vtype}: {len(coords)}", marker="x"
             )
 
@@ -593,6 +600,41 @@ class VisualRenderer:
         y2 = min(h, max_y + half)
 
         return (x1, y1, x2, y2)
+
+    @staticmethod
+    def _physical_to_grid(
+        coords: List[Tuple[float, float]],
+        w: int,
+        h: int,
+        die_area: Optional[Tuple[int, int, int, int]] = None,
+    ) -> Tuple[List[float], List[float]]:
+        """Map physical DBU coordinates to congestion-map grid coordinates."""
+        if die_area is None:
+            die_area = (0, 0, max(w, h), max(w, h))
+        die_w = max(die_area[2] - die_area[0], 1)
+        die_h = max(die_area[3] - die_area[1], 1)
+
+        px = [max(0, min(w - 1, (x - die_area[0]) / die_w * w)) for x, _ in coords]
+        py = [max(0, min(h - 1, (y - die_area[1]) / die_h * h)) for _, y in coords]
+        return px, py
+
+    @staticmethod
+    def _physical_bbox_to_grid(
+        bbox: Tuple[int, int, int, int],
+        w: int,
+        h: int,
+        die_area: Optional[Tuple[int, int, int, int]] = None,
+    ) -> Tuple[int, int, int, int]:
+        """Map a physical bbox to grid cell indices, clamped to the map bounds."""
+        x1, y1, x2, y2 = bbox
+        px, py = VisualRenderer._physical_to_grid(
+            [(x1, y1), (x2, y2)], w, h, die_area
+        )
+        gx1 = max(0, int(min(px)))
+        gy1 = max(0, int(min(py)))
+        gx2 = min(w, int(max(px)) + 1)
+        gy2 = min(h, int(max(py)) + 1)
+        return gx1, gy1, gx2, gy2
 
     def _format_stats(self, stats: Dict, metrics: Optional[Dict]) -> str:
         lines = []

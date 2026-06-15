@@ -8,6 +8,7 @@ back to DEF.  The generated routes are then validated and repaired by
 OpenROAD's detailed router.
 """
 
+import re
 from typing import Dict, List, Optional, Set, Tuple
 
 from .def_parser import DefParser
@@ -35,6 +36,9 @@ class FishboneRouter:
         self.die_area = DefParser.parse_die_area(def_file)
         self.lef_layers = (
             DefParser.parse_lef_layers(lef_file) if lef_file else {}
+        )
+        self.lef_vias = (
+            DefParser.parse_lef_vias(lef_file) if lef_file else {}
         )
 
     def fishbone_route_net(
@@ -127,6 +131,19 @@ class FishboneRouter:
                 alt = f"Metal{key[1:]}" if key[0] == "m" else c
                 if alt.lower() in available:
                     resolved.append(available[alt.lower()])
+            elif key.startswith("m") and key[1:].isdigit():
+                # "M3" -> "Metal3"
+                alt = f"Metal{key[1:]}"
+                if alt.lower() in available:
+                    resolved.append(available[alt.lower()])
+
+        # If LEF parsing yielded no layers, trust the candidate names directly.
+        if not available:
+            if len(resolved) >= 2:
+                return resolved[0], resolved[1]
+            if len(resolved) == 1:
+                return resolved[0], resolved[0]
+            return None, None
 
         if not resolved:
             return None, None
@@ -351,13 +368,33 @@ class FishboneRouter:
                 )
         return obstacles
 
+    def _select_via_name(self, layer_a: str, layer_b: str) -> str:
+        """Select a via connecting two routing layers."""
+        layer_set = {layer_a.lower(), layer_b.lower()}
+
+        # Try to match a via from the LEF via definitions.
+        for via_name, via_info in self.lef_vias.items():
+            via_layers = {l.lower() for l in via_info.get("layers", [])}
+            if layer_set <= via_layers:
+                return via_name
+
+        # Fallback: derive via name from layer numbers, e.g. Metal2+Metal3 -> VIA23_1C
+        def layer_num(name: str) -> int:
+            digits = re.findall(r"\d+", name)
+            return int(digits[0]) if digits else 0
+
+        nums = sorted([layer_num(layer_a), layer_num(layer_b)])
+        if len(nums) == 2 and nums[0] > 0 and nums[1] > 0:
+            return f"VIA{nums[0]}{nums[1]}_1C"
+        return "VIA"
+
     def _compose_def_routing(
         self,
         trunk_seg: Dict,
         branches: List[Dict],
         trunk_layer: str,
     ) -> str:
-        """Compose DEF route text from segments."""
+        """Compose DEF route text from segments, inserting vias where needed."""
         lines = []
 
         # Trunk
@@ -366,12 +403,20 @@ class FishboneRouter:
             f"( {trunk_seg['x2']} {trunk_seg['y2']} )"
         )
 
-        # Branches
+        # Branches: insert a via at the trunk intersection when layers differ.
         for seg in branches:
-            lines.append(
-                f"NEW {seg['layer']} ( {seg['x1']} {seg['y1']} ) "
-                f"( {seg['x2']} {seg['y2']} )"
-            )
+            need_via = seg["layer"].lower() != trunk_layer.lower()
+            if need_via:
+                via_name = self._select_via_name(seg["layer"], trunk_layer)
+                lines.append(
+                    f"NEW {seg['layer']} ( {seg['x1']} {seg['y1']} ) "
+                    f"( {seg['x2']} {seg['y2']} ) {via_name}"
+                )
+            else:
+                lines.append(
+                    f"NEW {seg['layer']} ( {seg['x1']} {seg['y1']} ) "
+                    f"( {seg['x2']} {seg['y2']} )"
+                )
 
         return "\n      ".join(lines)
 

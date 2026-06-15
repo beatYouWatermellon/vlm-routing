@@ -147,8 +147,9 @@ class DEFEditor:
                 f"Via {via_index} is at ({via.x},{via.y}), not {old_position}"
             )
 
+        net_range = self._find_net_range(net_name)
         new_nets_text = self._replace_via_text(
-            via.x, via.y, via.via_name, via.via_name, new_position
+            via.x, via.y, via.via_name, via.via_name, new_position, net_range
         )
         return self._write_def(new_nets_text)
 
@@ -171,7 +172,10 @@ class DEFEditor:
                 f"Via {via_index} is at ({via.x},{via.y}), not {position}"
             )
 
-        new_nets_text = self._replace_via_text(via.x, via.y, via.via_name, new_type)
+        net_range = self._find_net_range(net_name)
+        new_nets_text = self._replace_via_text(
+            via.x, via.y, via.via_name, new_type, net_range=net_range
+        )
         return self._write_def(new_nets_text)
 
     def replace_net_routing(
@@ -259,7 +263,13 @@ class DEFEditor:
             raise DEFEditError("Could not locate NETS section in DEF file")
 
         header = content[: nets_match.start(2)]
-        nets_text = nets_match.group(2).lstrip("\n\r\t ")
+        nets_text = nets_match.group(2)
+        # Preserve a single leading newline so header and first net stay on
+        # separate lines when the file is reconstructed.
+        if nets_text.startswith("\n"):
+            nets_text = nets_text[1:]
+        elif nets_text.startswith("\r\n"):
+            nets_text = nets_text[2:]
         footer = content[nets_match.end(2) :]
         return header, nets_text, footer
 
@@ -406,47 +416,70 @@ class DEFEditor:
         old_via_name: str,
         new_via_name: str,
         new_position: Optional[Tuple[int, int]] = None,
+        net_range: Optional[Tuple[int, int]] = None,
     ) -> str:
         """
         Replace a via instance in the NETS section.
 
         Handles both explicit coordinates and '*' relative coordinates.
+        When ``net_range`` is supplied, the search is confined to that net block
+        so that vias in other nets are not accidentally modified.
         """
+        text = self.nets_text
+        offset = 0
+        if net_range is not None:
+            text = self.nets_text[net_range[0] : net_range[1]]
+            offset = net_range[0]
+
         # Try exact coordinate match first
         exact = f"( {vx} {vy} ) {old_via_name}"
-        if exact in self.nets_text:
+        idx = text.find(exact)
+        if idx != -1:
+            abs_idx = offset + idx
             new_coord = (
                 f"( {new_position[0]} {new_position[1]} )"
                 if new_position
                 else f"( {vx} {vy} )"
             )
-            return self.nets_text.replace(exact, f"{new_coord} {new_via_name}", 1)
+            return (
+                self.nets_text[:abs_idx]
+                + f"{new_coord} {new_via_name}"
+                + self.nets_text[abs_idx + len(exact) :]
+            )
 
         # Fallback: regex that allows '*' for x or y
         via_pattern = re.compile(
             rf"\(\s*(?:{vx}|\*)\s+(?:{vy}|\*)\s*\)\s+{re.escape(old_via_name)}"
         )
-        match = via_pattern.search(self.nets_text)
+        match = via_pattern.search(text)
         if not match:
             raise DEFEditError(
                 f"Could not locate via text at ({vx},{vy}) named {old_via_name}"
             )
 
+        abs_start = offset + match.start()
+        abs_end = offset + match.end()
         new_coord = (
             f"( {new_position[0]} {new_position[1]} )"
             if new_position
             else match.group(0).split(old_via_name)[0].strip()
         )
         return (
-            self.nets_text[: match.start()]
+            self.nets_text[:abs_start]
             + f"{new_coord} {new_via_name}"
-            + self.nets_text[match.end() :]
+            + self.nets_text[abs_end:]
         )
 
     def _write_def(self, new_nets_text: str) -> str:
         output_path = str(Path(self.def_file).with_suffix("")) + "_edited.def"
+        header = self.header
+        if header and not header.endswith("\n"):
+            header += "\n"
+        footer = self.footer
+        if footer and not footer.startswith("\n"):
+            footer = "\n" + footer
         Path(output_path).write_text(
-            self.header + new_nets_text + self.footer, encoding="utf-8"
+            header + new_nets_text + footer, encoding="utf-8"
         )
         return output_path
 

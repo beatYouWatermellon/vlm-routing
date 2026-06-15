@@ -5,6 +5,7 @@ agent:
   patience: 5
   checkpoint_interval: 1
   enable_fine_actions: true
+  enable_local_eval: false
   local_edit_threshold_nets: 3
 
 vlm:

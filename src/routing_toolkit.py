@@ -699,6 +699,7 @@ detailed_route -output_drc {drc_rpt} -verbose 0
     ) -> List[DRCViolation]:
         """Parse the DRC report file into DRCViolation objects."""
         nets = DefParser.parse_nets(def_file)
+        die_area = DefParser.parse_die_area(def_file)
         violations: List[DRCViolation] = []
 
         # Pre-build segment and via spatial indexes per layer
@@ -751,7 +752,7 @@ detailed_route -output_drc {drc_rpt} -verbose 0
                         nets_involved.add(net_name)
 
             severity = self._compute_violation_severity(
-                vtype, center, congestion_map
+                vtype, center, congestion_map, die_area=die_area
             )
 
             violations.append(
@@ -878,6 +879,7 @@ detailed_route -output_drc {drc_rpt} -verbose 0
         vtype: str,
         center: Tuple[int, int],
         congestion_map: Optional[np.ndarray],
+        die_area: Optional[Tuple[int, int, int, int]] = None,
     ) -> float:
         base_weights = {
             "short": 10.0,
@@ -892,24 +894,30 @@ detailed_route -output_drc {drc_rpt} -verbose 0
                 base = weight
                 break
 
-        cong_val = self._lookup_congestion(congestion_map, center)
+        cong_val = self._lookup_congestion(congestion_map, center, die_area)
         return base * (1.0 + cong_val)
 
     @staticmethod
     def _lookup_congestion(
-        congestion_map: Optional[np.ndarray], center: Tuple[int, int]
+        congestion_map: Optional[np.ndarray],
+        center: Tuple[int, int],
+        die_area: Optional[Tuple[int, int, int, int]] = None,
     ) -> float:
         if congestion_map is None or congestion_map.size == 0:
             return 0.0
 
         h, w = congestion_map.shape
-        die_area = (0, 0, 390800, 383040)  # placeholder; caller should supply scale
-        # Use normalized coordinates assuming the map covers a square-ish design
-        # This is a heuristic; a more accurate mapping uses die_area.
         cx, cy = center
-        max_dim = max(w, h)
-        px = int((cx / max_dim) % w)
-        py = int((cy / max_dim) % h)
+
+        if die_area is None:
+            # Last-resort fallback: assume coordinates are already in grid space.
+            die_area = (0, 0, max(w, h), max(w, h))
+
+        die_w = max(die_area[2] - die_area[0], 1)
+        die_h = max(die_area[3] - die_area[1], 1)
+
+        px = int((cx - die_area[0]) / die_w * w)
+        py = int((cy - die_area[1]) / die_h * h)
         px = max(0, min(px, w - 1))
         py = max(0, min(py, h - 1))
         return float(congestion_map[py, px])
@@ -1047,8 +1055,9 @@ write_db $::env(OUTPUT_DIR)/routed.odb
         )
 
         if retcode != 0:
-            print(f"[ERROR] Baseline routing failed: {stderr[:500]}")
-            return def_file
+            msg = stderr[:500] if stderr else stdout[-500:]
+            print(f"[ERROR] Baseline routing failed: {msg}")
+            raise RuntimeError(f"Baseline routing failed (exit {retcode}): {msg}")
 
         print(f"[OK] Baseline routing complete: {output_def}")
         self.current_def = str(output_def)
@@ -1150,7 +1159,8 @@ write_def $::env(OUTPUT_DEF)
         )
 
         if retcode != 0:
-            print(f"[WARNING] Incremental routing failed: {stderr[:300]}")
+            msg = stderr[:300] if stderr else stdout[-500:]
+            print(f"[WARNING] Incremental routing failed: {msg}")
             return def_file
 
         self.iteration += 1
@@ -1175,6 +1185,7 @@ write_def $::env(OUTPUT_DEF)
         bbox: Tuple[int, int, int, int],
         layers: List[str],
         output_name: Optional[str] = None,
+        hardness: str = "hard",
     ) -> str:
         """Insert a BLOCKAGES section into the DEF before END DESIGN."""
         if output_name is None:
@@ -1188,8 +1199,11 @@ write_def $::env(OUTPUT_DEF)
         x1, y1, x2, y2 = bbox
         blockage_entries = []
         for layer in layers:
+            # DEF does not have a standard soft/hard attribute.  We add a
+            # comment as a placeholder for downstream tooling.
+            comment = f"# {hardness.upper()} BLOCKAGE\n    " if hardness == "soft" else ""
             blockage_entries.append(
-                f"    - LAYER {layer}"
+                f"{comment}    - LAYER {layer}"
                 f"      RECT ( {x1} {y1} ) ( {x2} {y2} ) ;"
             )
 
